@@ -26,7 +26,7 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 - 连接地址（顺序尝试）：`wss://broker.emqx.io:8084/mqtt` → `wss://broker.hivemq.com:8884/mqtt`；房间 = topic `gridwalker/phase2/<ROOM>`（`?room=` URL 参数可覆盖，默认 `GRIDWALKER`）
 - 每台手机只写自己的 `me`（x/y/color/携带/交付），`net.js` 以 pstate 消息广播（兼 1.5 秒心跳）；其他玩家从 `guests` 读取渲染；4 秒无消息自动移除
 - JOIN 反馈：Connecting… / Connected ✓ / Connection Failed（附具体原因）
-- 新玩家自动分配颜色与出生点（30 种颜色 + 30 个出生点，最多 30 人）；加入/离开/断线重连由 `net.js` 处理（hello / bye / 心跳超时 / mqtt 自动重连）
+- 新玩家自动分配颜色（30 色调色板，冲突按玩家 ID 字典序确定性让位）；加入/离开/断线重连由 `net.js` 处理（hello / bye / 心跳超时 / mqtt 自动重连）
 - HUD 显示连接状态与在线人数
 
 ### 占地（Territory）
@@ -36,7 +36,7 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 - 同步：`shared.cells["x,y"] = { o: 玩家ID, c: 颜色下标 }`，由 `net.js` 广播 cell 消息（带 (ts,id) 时间戳），所有设备按统一规则收敛到同一份值；中途加入的玩家通过 hello/room-ping 获得完整 room-state 快照
 - `me.carryingObject` 携带 Object 时不占领
 - HUD 显示自己拥有的格子数（开发测试用，无全局排名）
-- **出生点 = 基地全部在地图外围**，到中央 Object 区最近格子的曼哈顿距离相等（11 格），无人出生在中央
+- **基地按本局人数动态分配**（写入 `shared.game.bases`，所有设备一致）：2 人左右对称、4 人四角、8 人四角+四边中点、其他人数沿地图外圈均匀分布；开赛前统一落位，比赛期间锁定
 
 ### Object（拾取 / 携带 / 交付）
 
@@ -55,14 +55,14 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 - 倒计时期间有人取消准备 / 断线 / 新玩家加入 → 自动取消并回到等待状态
 - 比赛开始时锁定本局参与者名单：中途加入者观战（不能移动/占地/拾取/抢夺/交付，不参与计分）；PLAY AGAIN 后所有人恢复 Not Ready
 - 每局 120 秒：倒计时由共享状态驱动（`shared.game = { phase, round, startAt, readyAt, participants, objects }`），各设备在收到 running 时以本地时刻锁定起点、等长计时；任一台归零写 ended，所有设备同时冻结
-- 结束后：完整领地小地图 + 排名 + 得分明细（领地每格 +1，交付 Object 每个 +30，结束时仍携带每个 +15）；比赛中不显示任何人的总分/排名
+- 结束后：HTML 结算覆盖层（FINAL RESULTS）——放大的正方形完整地图 + 可滚动排行榜（排名/颜色/编号/总分与明细），PLAY AGAIN 固定在底部
 - **PLAY AGAIN**：清空地图与物品、所有玩家回基地并清空携带/交付数、恢复 Not Ready，回到大厅
 - 同时 READY / 结束 / PLAY AGAIN：阶段转换写入 + (ts,id) LWW 收敛 + 局号去重（每局每台只重置/锁定一次）
 
 ### Object（动态数量 + Emoji）
 
 - 数量按本局参与人数查表：1–3 人 → 2 个，4–6 → 3，7–9 → 4，10–12 → 5，13–15 → 7，16–20 → 9，21–25 → 11，26–30 → 13
-- 布局（id / emoji / 坐标）在比赛开始时由共享状态 `shared.game.objects` 决定，所有设备完全一致；位置在地图中部区域随机不重叠、避开出生点；PLAY AGAIN 后按新人数重新生成
+- 布局（id / emoji / 坐标）在比赛开始时由共享状态 `shared.game.objects` 决定，所有设备完全一致；位置在地图中部区域随机不重叠、避开基地；PLAY AGAIN 后按新人数重新生成
 - 每个 Object 用不同 Emoji（📺📻📷🎮💻📱🎸🧸📼💿📚🕹️🎧），地上有轻微浮动动画，携带者头顶显示对应 Emoji
 
 ### 联机（SharedRoom，无需自建服务器）

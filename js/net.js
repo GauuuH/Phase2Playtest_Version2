@@ -207,6 +207,7 @@ function _snapshotGame() {
     startAt: g.startAt,
     readyAt: g.readyAt,
     participants: g.participants,
+    bases: g.bases,
     objects: g.objects
   };
 }

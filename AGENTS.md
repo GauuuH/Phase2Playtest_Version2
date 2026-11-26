@@ -14,7 +14,10 @@
   手势内自动请求授权并以首次读数自动校准）、双指点击（抢夺）；桌面保留 WASD/方向键调试。
 - 赛制 = READY 准备机制：全员就绪自动 3 秒倒计时开赛（lobby → countdown → running），
   参与者名单开赛时锁定，中途加入者观战；下一局恢复 Not Ready。
-- Object 为动态数量（2~13 个，按参与人数查表）+ Emoji 视觉，布局写入 shared.game.objects。
+- Object 为动态数量（2~13 个，按参与人数查表）+ Emoji 泡泡视觉，布局写入 shared.game.objects。
+- 视觉风格：Premium Dark UI（地图 #252A32 背景 / #343A43 中立地砖 / 倒角+圆角+间隙），
+  领地地砖用玩家调和色并带 150ms 易主过渡（纯视觉）；基地由 shared.game.bases 按人数确定性分配；
+  结算用 HTML 覆盖层（放大正方形地图 + 可滚动排行榜）。
 - 联机架构 = SharedRoom（MQTT）：js/vendor/mqtt.min.js + js/net.js，
   broker 为 wss://broker.emqx.io:8084/mqtt 与 wss://broker.hivemq.com:8884/mqtt
   （复用 DECIDER Phase2 旧项目 my-project-phase-2 的方案）。不要改回 p5-phone，不要更换服务器地址。

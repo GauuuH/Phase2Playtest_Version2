@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport"
         content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <meta name="theme-color" content="#181b26" />
+  <meta name="theme-color" content="#252A32" />
   <title>DECIDER</title>
 
   <link rel="stylesheet" href="style.css" />
@@ -185,7 +185,7 @@
         })
         .then(function () {
           status('Loading sketch.js…');
-          return loadScript('sketch.js?v=9');
+          return loadScript('sketch.js?v=10');
         })
         .then(function () {
           sketchReady = true;
@@ -206,11 +206,60 @@
     <!-- 状态行：加载进度、JOIN 反馈、错误信息都在这里可见 -->
     <div id="net-status">Loading…</div>
 
-    <!-- 操作区：JOIN + READY（手机用滑动/倾斜/双指操作，无需方向按钮与校准按钮） -->
+    <!-- 操作区：JOIN + READY + HOW TO PLAY（手机用滑动/倾斜/双指操作，无需方向按钮与校准按钮） -->
     <div id="controls">
       <div id="control-top">
         <button id="btn-join" class="cal-btn" aria-label="Join shared room">JOIN</button>
         <button id="btn-ready" class="cal-btn" aria-label="Toggle ready">READY</button>
+        <button id="btn-howto" class="howto-btn" aria-label="How to play">?</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- HOW TO PLAY 弹窗：深灰高级风格，首次进入自动显示一次，可随时点 ? 打开 -->
+  <div id="howto-overlay" hidden>
+    <div id="howto-panel">
+      <h1 id="howto-title">HOW TO PLAY</h1>
+      <div id="howto-content">
+        <section>
+          <h2>CLAIM TERRITORY</h2>
+          <p>Move across tiles to claim them.<br>Walk over enemy tiles to take them.</p>
+        </section>
+        <section>
+          <h2>COLLECT OBJECTS</h2>
+          <p>Pick up objects by moving onto them.<br>Carry them back to your base.</p>
+        </section>
+        <section>
+          <h2>STEAL OBJECTS</h2>
+          <p>Get next to a player carrying an object.<br>Tap with two fingers to steal it.</p>
+        </section>
+        <section>
+          <h2>MOVEMENT</h2>
+          <p>Swipe Up / Down to move vertically.<br>Tilt Left / Right to move horizontally.</p>
+        </section>
+        <section>
+          <h2>SCORING</h2>
+          <p>Territory: +1 per tile<br>Delivered Object: +30<br>Carried Object: +15 at the end</p>
+        </section>
+        <section>
+          <h2>TIME LIMIT</h2>
+          <p>120 seconds per round.</p>
+        </section>
+      </div>
+      <div id="howto-footer">
+        <button id="btn-howto-close" class="cal-btn">GOT IT</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- FINAL RESULTS 结算覆盖层：HTML/CSS 面板 + 放大地图 + 可滚动排行榜 -->
+  <div id="results-overlay" hidden>
+    <div id="results-panel">
+      <h1 id="results-title">FINAL RESULTS</h1>
+      <div id="results-map-wrap"><canvas id="results-map"></canvas></div>
+      <div id="results-list"></div>
+      <div id="results-footer">
+        <button id="btn-playagain" class="cal-btn">PLAY AGAIN</button>
       </div>
     </div>
   </div>

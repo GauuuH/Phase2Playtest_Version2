@@ -227,41 +227,22 @@ const PALETTE = [
   [240, 180, 120]    // 29 浅橙
 ];
 
-/* 30 个出生点（下标 = 颜色编号，所有设备一致）；同时是各玩家的基地。
- * 前 7 个保持原公平布局（到中央 Object 区最近一格曼哈顿距离 = 11），
- * 其余沿地图四边均匀铺开，尽量分散、互不重叠。 */
-const SPAWNS = [
-  { x: 0,  y: 9  },   // 0 左
-  { x: 23, y: 9  },   // 1 右
-  { x: 0,  y: 14 },   // 2 左
-  { x: 23, y: 14 },   // 3 右
-  { x: 9,  y: 0  },   // 4 上
-  { x: 14, y: 0  },   // 5 上
-  { x: 9,  y: 23 },   // 6 下
-  { x: 0,  y: 2  },   // 7 左
-  { x: 23, y: 21 },   // 8 右
-  { x: 4,  y: 0  },   // 9 上
-  { x: 19, y: 0  },   // 10 上
-  { x: 4,  y: 23 },   // 11 下
-  { x: 19, y: 23 },   // 12 下
-  { x: 0,  y: 4  },   // 13 左
-  { x: 23, y: 19 },   // 14 右
-  { x: 7,  y: 0  },   // 15 上
-  { x: 16, y: 0  },   // 16 上
-  { x: 7,  y: 23 },   // 17 下
-  { x: 16, y: 23 },   // 18 下
-  { x: 0,  y: 6  },   // 19 左
-  { x: 23, y: 17 },   // 20 右
-  { x: 11, y: 0  },   // 21 上
-  { x: 12, y: 0  },   // 22 上
-  { x: 11, y: 23 },   // 23 下
-  { x: 12, y: 23 },   // 24 下
-  { x: 0,  y: 16 },   // 25 左
-  { x: 23, y: 7  },   // 26 右
-  { x: 21, y: 0  },   // 27 上
-  { x: 2,  y: 0  },   // 28 上
-  { x: 2,  y: 23 }    // 29 下
-];
+/* ---------------- 地图视觉（Modern Minimalist · Premium Dark UI） ---------------- */
+const MAP_BG        = '#252A32';   // 地图背景 / 格子间隙
+const NEUTRAL_TILE  = [52, 58, 67];   // 中立地砖 #343A43
+const TILE_BORDER   = [68, 75, 86];   // 地砖边框 #444B56
+const TILE_R        = 4;              // 地砖圆角（3–5px）
+const CELL_TAKE_MS  = 150;            // 领地易主颜色过渡时长（120–180ms）
+
+/* 玩家颜色 → 地砖色：略微降低饱和度并与灰底调和，鲜明但不刺眼 */
+function tileColorOfIdx(colorIdx) {
+  const p = PALETTE[((colorIdx % PALETTE.length) + PALETTE.length) % PALETTE.length];
+  return [
+    Math.round(p[0] * 0.76 + NEUTRAL_TILE[0] * 0.24),
+    Math.round(p[1] * 0.76 + NEUTRAL_TILE[1] * 0.24),
+    Math.round(p[2] * 0.76 + NEUTRAL_TILE[2] * 0.24)
+  ];
+}
 
 /* Object 视觉：唯一 ID（o1..o13）→ Emoji 下标固定映射，所有设备一致。
  * Emoji 仅作为视觉资源，不进入同步逻辑。 */
@@ -315,6 +296,55 @@ function generateObjectLayout(round, playerCount) {
     });
   }
   return objs;
+}
+
+/* ============================================================
+ * 基地分配 —— 与颜色/身份解耦，随本局人数动态计算
+ * 输入：按唯一玩家 ID 字典序排序的本局参与者名单（来自共享状态，
+ *       绝不依赖各设备本地 guests 数组顺序）
+ * 输出：{ playerId: {x, y} }，所有设备用同一算法得到完全相同的结果，
+ *       并随 countdown 一起写入 shared.game.bases 作为权威状态。
+ * 布局：2 人左右水平对称；4 人四角；8 人四角+四边中点；
+ *       其他人数沿地图外圈（88 个边缘格）均匀取点，互不重叠。
+ * ============================================================ */
+function perimeterCellList() {
+  const cells = [];
+  for (let x = 1; x <= 22; x++) cells.push({ x: x, y: 0 });
+  for (let y = 1; y <= 22; y++) cells.push({ x: 23, y: y });
+  for (let x = 22; x >= 1; x--) cells.push({ x: x, y: 23 });
+  for (let y = 22; y >= 1; y--) cells.push({ x: 0, y: y });
+  return cells;   // 88 个边缘格
+}
+
+function computeBases(sortedIds) {
+  const bases = {};
+  const n = (sortedIds || []).length;
+  if (n <= 0) return bases;
+  if (n === 2) {
+    // 两名玩家：最左 / 最右，水平对称
+    bases[sortedIds[0]] = { x: 0, y: 12 };
+    bases[sortedIds[1]] = { x: 23, y: 12 };
+  } else if (n === 4) {
+    // 四名玩家：四个角落
+    bases[sortedIds[0]] = { x: 0, y: 0 };
+    bases[sortedIds[1]] = { x: 23, y: 0 };
+    bases[sortedIds[2]] = { x: 0, y: 23 };
+    bases[sortedIds[3]] = { x: 23, y: 23 };
+  } else if (n === 8) {
+    // 八名玩家：四角 + 四条边中点
+    const pts = [
+      { x: 0, y: 0 }, { x: 23, y: 0 }, { x: 0, y: 23 }, { x: 23, y: 23 },
+      { x: 12, y: 0 }, { x: 23, y: 12 }, { x: 12, y: 23 }, { x: 0, y: 12 }
+    ];
+    for (let i = 0; i < 8; i++) bases[sortedIds[i]] = pts[i];
+  } else {
+    // 其他人数：沿外圈均匀取点
+    const P = perimeterCellList();
+    for (let i = 0; i < n; i++) {
+      bases[sortedIds[i]] = P[Math.floor((i * P.length) / n)];
+    }
+  }
+  return bases;
 }
 
 /* ---------------- 游戏状态（摄像机等本地状态） ---------------- */
@@ -447,6 +477,53 @@ function readyCount() {
   return n;
 }
 
+/* 每帧：把共享状态里的基地分配应用到本机（me.baseX/baseY + 开赛前落位）。
+ * 基地在 countdown 写入共享状态后锁定；比赛中断线/重连不影响其他玩家，
+ * 重连参与者若仍在默认出生位置则回到自己的基地。 */
+function applyMyBase() {
+  const g = window.shared.game;
+  if (!g || !g.bases || typeof g.bases !== 'object') return;
+  const b = g.bases[myOwnerId()];
+  if (!b || typeof b.x !== 'number' || typeof b.y !== 'number') return;
+  if (me.baseX === b.x && me.baseY === b.y) return;
+
+  me.baseX = b.x;
+  me.baseY = b.y;
+
+  const p = gamePhase();
+  const freshDefault = me.x === 12 && me.y === 12;
+  if (p === 'lobby' || p === 'countdown' || (p === 'running' && freshDefault)) {
+    me.x = b.x;
+    me.y = b.y;
+    gameState.render.x = (b.x + 0.5) * CELL;
+    gameState.render.y = (b.y + 0.5) * CELL;
+  }
+}
+
+/* 按玩家 id 找当前颜色下标：自己 → guests → 离线快照 */
+function colorIdxOfPlayer(id) {
+  if (String(id) === myOwnerId()) {
+    return (typeof me.color === 'number' && me.color >= 0) ? me.color : -1;
+  }
+  const gs = window.guests || [];
+  for (const g of gs) {
+    if (String(g.id) === String(id)) {
+      return (typeof g.color === 'number' && g.color >= 0) ? g.color : -1;
+    }
+  }
+  const off = window.guestsOffline || [];
+  for (const o of off) {
+    if (String(o.id) === String(id)) {
+      return (typeof o.color === 'number' && o.color >= 0) ? o.color : -1;
+    }
+  }
+  return -1;
+}
+
+function playerColorById(id) {
+  return colorOf(colorIdxOfPlayer(id));
+}
+
 function remainingMs() {
   if (!gameIsRunning()) return GAME_DURATION;
   if (game.localStartAt > 0) {
@@ -549,11 +626,13 @@ function updateReadyFlow() {
     const allReady = allPlayersReady();
     if (allReady && game.lastAllReady !== true) {
       game.lastAllReady = true;   // 上升沿：只写一次
+      const ids = currentParticipantIds();
       window.shared.game = {
         phase: 'countdown',
         round: round,
         readyAt: Date.now(),
-        participants: currentParticipantIds()
+        participants: ids,
+        bases: computeBases(ids)      // 基地分配随参与者名单一起锁定
       };
     } else if (!allReady) {
       game.lastAllReady = false;
@@ -568,21 +647,25 @@ function updateReadyFlow() {
     // 取消：有人取消准备 / 断线 / 新玩家加入（默认 Not Ready）
     if (!allPlayersReady()) {
       game.lastAllReady = false;
-      window.shared.game = { phase: 'lobby', round: round, participants: [] };
+      window.shared.game = { phase: 'lobby', round: round, participants: [], bases: {} };
       return;
     }
 
-    // 到点：统一开赛。多台同时写 running（同一 round、同一名单），
+    // 到点：统一开赛。多台同时写 running（同一 round、同一名单/基地），
     // (ts,id) LWW 收敛出唯一 startAt 与 Object 布局
     if (remain <= 0) {
       const ids = (g.participants && g.participants.length > 0)
         ? g.participants.map(String)
         : currentParticipantIds();
+      const bases = (g.bases && typeof g.bases === 'object')
+        ? g.bases
+        : computeBases(ids.slice().sort());
       window.shared.game = {
         phase: 'running',
         round: round,
         startAt: Date.now(),
         participants: ids,
+        bases: bases,
         objects: generateObjectLayout(round, ids.length)
       };
     }
@@ -971,68 +1054,123 @@ function drawStealFeedback() {
   text(steal.feedback.text, cx, cy);
 }
 
-/* 结算界面（仅 ended 阶段）：完整领地小地图 + 排名 + 得分明细。
- * 参与者最多 30 人：排行榜压缩显示，最多展示前 16 名 + “+N more”。 */
-function drawResults() {
-  if (gamePhase() !== 'ended') return;
-  const sc = game.scores || [];
+/* ============================================================
+ * FINAL RESULTS —— 独立 HTML/CSS 覆盖层（Premium Dark UI）
+ * · 覆盖在 Canvas 上方，不透明深灰背景，文字高对比；
+ * · 放大的 24×24 完整地图（正方形、约 92% 屏宽、与主画面一致的
+ *   商务灰倒角地砖风格）；
+ * · 排行榜支持纵向滚动，排名/颜色/编号/总分一眼可读，自己高亮；
+ * · PLAY AGAIN 固定在面板底部，不会被滚动内容遮挡。
+ * ============================================================ */
+let resultsShown = false;
 
-  // 遮罩
-  noStroke();
-  fill(0, 0, 0, 0.72);
-  rect(0, 0, width, height);
-
-  // 完整 24×24 领地小地图（按主人颜色缩放绘制）
-  const mapSize = Math.min(width * 0.86, height * 0.3);
-  const cs = mapSize / GRID;
-  const mx = (width - mapSize) / 2;
-  const my = 20;
-  for (let y = 0; y < GRID; y++) {
-    for (let x = 0; x < GRID; x++) {
-      const c = cellOwner(x, y);
-      if (c) {
-        const col = PALETTE[(typeof c.c === 'number' && c.c >= 0 ? c.c : 0) % PALETTE.length];
-        fill(col[0], col[1], col[2]);
-      } else {
-        fill(52, 60, 50);
-      }
-      rect(mx + x * cs, my + y * cs, cs + 0.6, cs + 0.6);
+function updateResultsOverlay() {
+  const overlay = document.getElementById('results-overlay');
+  if (!overlay) return;
+  if (gamePhase() === 'ended') {
+    if (!resultsShown) {
+      resultsShown = true;
+      overlay.hidden = false;      // 先显示再构建：布局尺寸此时才可测量
+      buildResultsOverlay();
+    }
+  } else {
+    if (resultsShown) {
+      resultsShown = false;
+      overlay.hidden = true;
     }
   }
-  noFill();
-  stroke(255, 255, 255, 80);
-  strokeWeight(1);
-  rect(mx, my, mapSize, mapSize);
+}
 
-  // 排名与明细（压缩行高，最多 16 行）
-  const MAX_ROWS = 16;
-  textAlign(LEFT, TOP);
-  let ty = my + mapSize + 10;
-  textSize(16);
-  fill(255, 209, 102);
-  text('Final Results', 16, ty);
-  ty += 24;
-  const rows = Math.min(sc.length, MAX_ROWS);
-  for (let i = 0; i < rows; i++) {
+function buildResultsOverlay() {
+  renderResultsMap();
+  renderResultsList();
+}
+
+/* 放大地图：2D canvas 直接绘制（与主画面同一套地砖配色与倒角） */
+function renderResultsMap() {
+  const canvas = document.getElementById('results-map');
+  const wrap = document.getElementById('results-map-wrap');
+  if (!canvas || !wrap) return;
+  const size = Math.floor(wrap.clientWidth);
+  if (size <= 0) return;
+  const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+  canvas.width = size * dpr;
+  canvas.height = size * dpr;
+  canvas.style.width = size + 'px';
+  canvas.style.height = size + 'px';
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = MAP_BG;
+  ctx.fillRect(0, 0, size, size);
+
+  const ts = size / GRID;   // 每格像素
+  for (let y = 0; y < GRID; y++) {
+    for (let x = 0; x < GRID; x++) {
+      const cell = cellOwner(x, y);
+      const idx = cell ? colorIdxOfPlayer(cell.o) : -1;
+      const col = (cell && idx >= 0) ? tileColorOfIdx(idx) : NEUTRAL_TILE;
+      drawTileBevel2D(ctx, x * ts + 0.5, y * ts + 0.5, ts - 1, ts - 1, col, Math.max(2, ts * 0.1));
+    }
+  }
+}
+
+/* 2D 版倒角地砖（供结算地图用，与 p5 版视觉一致） */
+function drawTileBevel2D(ctx, x, y, w, h, col, r) {
+  ctx.fillStyle = 'rgb(' + col[0] + ',' + col[1] + ',' + col[2] + ')';
+  roundRect2D(ctx, x, y, w, h, r);
+  ctx.fill();
+
+  ctx.fillStyle = 'rgba(255,255,255,0.10)';
+  roundRect2D(ctx, x + 1, y + 1, w - 2, h * 0.18, Math.max(1, r - 1));
+  ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.13)';
+  roundRect2D(ctx, x + 1, y + h - 1 - h * 0.18, w - 2, h * 0.18, Math.max(1, r - 1));
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(68,75,86,0.5)';
+  ctx.lineWidth = 0.5;
+  roundRect2D(ctx, x + 0.5, y + 0.5, w - 1, h - 1, r);
+  ctx.stroke();
+}
+
+function roundRect2D(ctx, x, y, w, h, r) {
+  if (typeof ctx.roundRect === 'function') {
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, r);
+    return;
+  }
+  // 兜底：手绘圆角矩形
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function renderResultsList() {
+  const listEl = document.getElementById('results-list');
+  if (!listEl) return;
+  const sc = game.scores || [];
+  let html = '';
+  for (let i = 0; i < sc.length; i++) {
     const p = sc[i];
     const col = PALETTE[p.color % PALETTE.length];
     const isMe = p.id === myOwnerId();
-    noStroke();
-    fill(col[0], col[1], col[2]);
-    circle(24, ty + 5, 10);
-    fill(255);
-    textSize(12);
-    text((i + 1) + '. ' + (isMe ? 'YOU' : 'P' + (p.color + 1)) + '  ' + p.total + ' pts', 40, ty);
-    fill(205, 205, 215);
-    textSize(10);
-    text('Territory ' + p.cells + ' · Delivered ' + p.delivered + '×30 · Carried ' + p.carried + '×15', 40, ty + 15);
-    ty += 24;
+    const name = 'P' + (p.color + 1) + (isMe ? ' <span class="me-tag">YOU</span>' : '');
+    html +=
+      '<div class="rrow' + (isMe ? ' me' : '') + '">' +
+        '<div class="rrank">' + (i + 1) + '</div>' +
+        '<div class="rdot" style="background:rgb(' + col[0] + ',' + col[1] + ',' + col[2] + ')"></div>' +
+        '<div class="rname">' + name + '</div>' +
+        '<div class="rtotal">' + p.total + ' <span style="font-size:12px;color:#c6ccd8">pts</span></div>' +
+      '</div>' +
+      '<div class="rdetail">Territory ' + p.cells + ' &nbsp;·&nbsp; Delivered ' + p.delivered +
+        ' &nbsp;·&nbsp; Carried ' + p.carried + '</div>';
   }
-  if (sc.length > rows) {
-    fill(205, 205, 215);
-    textSize(11);
-    text('+' + (sc.length - rows) + ' more players…', 40, ty + 2);
-  }
+  listEl.innerHTML = html;
 }
 
 // 双指同时点击画布（< 350ms 内两根手指都按下）→ 触发一次抢夺尝试
@@ -1056,15 +1194,22 @@ function bindTwoFingerTap(canvasEl) {
 }
 
 /* ============================================================
- * 颜色 / 出生点分配（每帧调用，仅在已连接时生效）
- * 说明：1.15.0 没有 shareJoined 回调，所以用轻量轮询；
- *       guests 最多 7 人，每帧扫一遍开销可忽略。
+ * 颜色分配（每帧调用，仅在已连接时生效）
+ * · 颜色从 30 色调色板中取第一个空闲色（确定性规则）；
+ * · 冲突解决：两台同时拿到同色时，玩家 ID 字典序小者保留、大者让位
+ *   重选——所有设备收敛到同一结果，不依赖随机；
+ * · 比赛中冻结：参与者一旦开赛颜色不再变化（保证同一局颜色/编号稳定），
+ *   观战者仍可正常解决冲突；
+ * · 出生位置不再与颜色绑定：初始站在地图中央，开赛前由基地分配落位。
  * ============================================================ */
 function ensureMyColor() {
   if (!isConnected()) return;
   const myId = getMyId();
   const gs = window.guests || [];
   const myColor = typeof me.color === 'number' ? me.color : -1;
+
+  // 比赛中冻结参与者的颜色（保证同一局内颜色/编号稳定）
+  if (gameIsRunning() && myColor >= 0 && amIParticipant()) return;
 
   // 已有颜色且不冲突 → 不动
   if (myColor >= 0 && myColor < PALETTE.length) {
@@ -1083,19 +1228,9 @@ function ensureMyColor() {
   while (used.has(idx) && idx < PALETTE.length) idx++;
   idx = idx % PALETTE.length;
 
-  const isNew = myColor < 0;
   me.color = idx;
-  if (isNew) {
-    const s = SPAWNS[idx % SPAWNS.length];
-    me.x = s.x;   // 新玩家放到自己的出生点；重连玩家保留原位置
-    me.y = s.y;
-    me.baseX = s.x;   // 基地 = 出生点（随 me 同步给其他玩家）
-    me.baseY = s.y;
-    // 视觉坐标直接落位到出生点（避免跨图滑行）
-    gameState.render.x = (s.x + 0.5) * CELL;
-    gameState.render.y = (s.y + 0.5) * CELL;
-    captureCell(s.x, s.y);   // 出生格子自动归自己所有
-  }
+  // 位置与基地不再在这里设置：新玩家站在地图中央等待，开赛前由
+  // shared.game.bases 统一落位（applyMyBase）。
 }
 
 /* ============================================================
@@ -1283,71 +1418,102 @@ function tryLockPortrait() {
 
 /* ============================================================
  * 渲染 —— 只负责画，不负责改数据
+ * 地砖风格：中性商务灰 + 轻微倒角（顶部/左侧高光、底部/右侧阴影）
+ * + 3–5px 圆角 + 1px 间隙。被占领的地砖保持同一套倒角，仅底色换成
+ * 玩家的调和色；所有权变化时做 150ms 颜色过渡（纯视觉，不触碰
+ * 共享状态，不影响同步）。
  * ============================================================ */
+
+/* 每格领地易主的视觉过渡状态（key → {from,to,t0,dur}） */
+const cellVisual = {
+  lastOwner: new Map(),
+  trans: new Map()
+};
+
+function cellVisualColor(x, y, ownerId, target) {
+  const key = x + ',' + y;
+  const lastO = cellVisual.lastOwner.get(key);
+  const now = millis();
+  const t = cellVisual.trans.get(key);
+
+  // 所有权变化 → 从当前显示色过渡到目标色（easeOutQuad，150ms）
+  if (lastO !== ownerId) {
+    const from = (t && t.to) ? t.to : target;
+    cellVisual.trans.set(key, { from: from, to: target, t0: now, dur: CELL_TAKE_MS });
+    cellVisual.lastOwner.set(key, ownerId);
+    return from;
+  }
+
+  if (!t) return target;
+  const k = constrain((now - t.t0) / t.dur, 0, 1);
+  if (k >= 1) {
+    cellVisual.trans.delete(key);
+    return target;
+  }
+  const e = 1 - (1 - k) * (1 - k);
+  return [
+    t.from[0] + (t.to[0] - t.from[0]) * e,
+    t.from[1] + (t.to[1] - t.from[1]) * e,
+    t.from[2] + (t.to[2] - t.from[2]) * e
+  ];
+}
+
 function drawTiles() {
-  noStroke();
   for (let y = 0; y < GRID; y++) {
     for (let x = 0; x < GRID; x++) {
-      fill(cellFillColor(x, y));
-      rect(x * CELL, y * CELL, CELL, CELL);
-      drawLandmark(x, y);
+      const cell = cellOwner(x, y);
+      // 被占领格使用“主人当前颜色”（而非 cell.c 快照），保证颜色重分配后
+      // 地砖、角色、基地、结算全部一致
+      const ownerColorIdx = cell ? colorIdxOfPlayer(cell.o) : -1;
+      const target = (cell && ownerColorIdx >= 0)
+        ? tileColorOfIdx(ownerColorIdx)
+        : NEUTRAL_TILE;
+      const col = cellVisualColor(x, y, cell ? cell.o : null, target);
+      drawTileBevel(x * CELL + 1, y * CELL + 1, CELL - 2, CELL - 2, col, TILE_R);
     }
   }
+}
 
-  stroke(0, 0, 0, 25);
+/* 单块倒角地砖：底色 + 上/左高光 + 下/右阴影 + 细边框 + 圆角 */
+function drawTileBevel(x, y, w, h, col, r) {
+  noStroke();
+  fill(col[0], col[1], col[2]);
+  rect(x, y, w, h, r);
+
+  // 顶部高光
+  fill(255, 255, 255, 26);
+  rect(x + 1, y + 1, w - 2, h * 0.18, r - 1, r - 1, 0, 0);
+  // 左侧高光
+  fill(255, 255, 255, 13);
+  rect(x + 1, y + 1, w * 0.18, h - 2, r - 1, 0, 0, r - 1);
+  // 底部阴影
+  fill(0, 0, 0, 34);
+  rect(x + 1, y + h - 1 - h * 0.18, w - 2, h * 0.18, 0, 0, r - 1, r - 1);
+  // 右侧阴影
+  fill(0, 0, 0, 20);
+  rect(x + w - 1 - w * 0.18, y + 1, w * 0.18, h - 2, 0, r - 1, r - 1, 0);
+
+  // 细边框
+  noFill();
+  stroke(TILE_BORDER[0], TILE_BORDER[1], TILE_BORDER[2], 120);
   strokeWeight(1);
-  for (let i = 0; i <= GRID; i++) {
-    line(i * CELL, 0, i * CELL, WORLD_H);
-    line(0, i * CELL, WORLD_W, i * CELL);
-  }
-}
-
-// 确定性地标（石头 / 树）
-function drawLandmark(x, y) {
-  const h = Math.floor(Math.abs(Math.sin(x * 127.1 + y * 311.7) * 43758.5453)) % 100;
-  const cx = x * CELL + CELL / 2;
-  const cy = y * CELL + CELL / 2;
-
-  if (h < 8) {
-    fill(140, 140, 152);
-    circle(cx, cy, CELL * 0.34);
-    fill(108, 108, 120);
-    circle(cx, cy + 2, CELL * 0.2);
-  } else if (h < 18) {
-    fill(60, 110, 66);
-    circle(cx, cy - CELL * 0.08, CELL * 0.55);
-    fill(46, 88, 52);
-    rect(cx - CELL * 0.05, cy + CELL * 0.08, CELL * 0.1, CELL * 0.2);
-  }
-}
-
-// 格子颜色：中立 = 棋盘绿；被占领 = 主人的代表色（浅色调，网格线仍清晰）
-function cellFillColor(x, y) {
-  const cell = cellOwner(x, y);
-  if (!cell) {
-    return (x + y) % 2 === 0 ? [143, 174, 107] : [132, 163, 98];
-  }
-  const c = PALETTE[
-    (typeof cell.c === 'number' && cell.c >= 0) ? cell.c % PALETTE.length : 0
-  ];
-  return [
-    Math.round(c[0] * 0.55 + 255 * 0.45),
-    Math.round(c[1] * 0.55 + 255 * 0.45),
-    Math.round(c[2] * 0.55 + 255 * 0.45)
-  ];
+  rect(x + 0.5, y + 0.5, w - 1, h - 1, r);
+  noStroke();
 }
 
 function drawBorder() {
   noFill();
-  stroke(255, 255, 255, 90);
-  strokeWeight(3);
-  rect(0, 0, WORLD_W, WORLD_H);
+  stroke(255, 255, 255, 60);
+  strokeWeight(2);
+  rect(0.5, 0.5, WORLD_W - 1, WORLD_H - 1);
 }
 
-/* 地面上的 Object（state = ground 才画）：Emoji + 轻微浮动动画
- * Emoji 兼容性：p5 的 text() 走 canvas fillText，iPhone Safari 与
- * Android Chrome 均自带彩色 Emoji 字体，可正常渲染。兜底：Emoji 缺失
- * 或渲染异常时，深色圆底徽章仍清晰可见；反馈文案中也带 Object ID。 */
+/* 地面上的 Object（state = ground 才画）：Emoji 泡泡
+ * · 统一金色强调：半透明深色泡泡 + 亮色边框 + 缓慢呼吸光晕；
+ * · 轻微上下浮动，一眼区别于普通灰色地砖；
+ * · Emoji 兼容性：p5 的 text() 走 canvas fillText，iPhone Safari 与
+ *   Android Chrome 均自带彩色 Emoji 字体，可正常渲染。兜底：泡泡本体
+ *   仍清晰标记物品位置，反馈文案中也带 Object ID。 */
 function drawObjects() {
   const objs = gameObjects();
   for (const o of objs) {
@@ -1356,28 +1522,60 @@ function drawObjects() {
 
     const cx = o.x * CELL + CELL / 2;
     const cy = o.y * CELL + CELL / 2;
-    // 轻微上下浮动 + 缩放，容易引起注意（相位按 id 错开）
+    // 轻微上下浮动 + 呼吸（相位按 id 错开，精致克制）
     const phase = (parseInt(String(o.id).slice(1), 10) || 1) * 1.7;
-    const floatY = Math.sin(millis() / 320 + phase) * CELL * 0.07;
-    const pulse = 1 + Math.sin(millis() / 420 + phase) * 0.05;
-    drawEmojiBadge(objectEmoji(o.id), cx, cy + floatY, CELL * 0.64 * pulse);
+    const floatY = Math.sin(millis() / 340 + phase) * CELL * 0.07;
+    drawEmojiBubble(objectEmoji(o.id), cx, cy + floatY, CELL * 0.7, millis(), phase);
   }
 }
 
-/* Emoji 徽章：深色圆底 + Emoji。任何设备上圆底都保证物品位置清晰可见。 */
-function drawEmojiBadge(emoji, cx, cy, size) {
+/* Emoji 泡泡：半透明深色圆底 + 金色亮边 + 缓慢呼吸光晕。size 为泡泡直径。 */
+function drawEmojiBubble(emoji, cx, cy, size, now, phase) {
+  const breathe = 1 + 0.045 * Math.sin((now || millis()) / 900 + (phase || 0));
+  const r = (size * breathe) / 2;
+
+  // 外层光晕（呼吸）
   noStroke();
-  fill(20, 24, 34, 190);
-  circle(cx, cy, size);
+  fill(255, 209, 102, 34 * (0.6 + 0.4 * Math.sin((now || millis()) / 900 + (phase || 0))));
+  circle(cx, cy, size * 1.22 * breathe);
+
+  // 泡泡主体：半透明深色
+  fill(24, 28, 36, 215);
+  circle(cx, cy, size * breathe);
+
+  // 金色亮边
+  noFill();
+  stroke(255, 209, 102, 200);
+  strokeWeight(2);
+  circle(cx, cy, size * breathe);
+  noStroke();
+
+  // 顶部高光（泡泡质感）
+  fill(255, 255, 255, 26);
+  circle(cx - r * 0.3, cy - r * 0.35, r * 0.55);
+
+  // Emoji
   const ch = (typeof emoji === 'string' && emoji.length > 0) ? emoji : '?';
   textAlign(CENTER, CENTER);
-  textSize(size * 0.6);
+  textSize(size * 0.58);
   fill(255);
   text(ch, cx, cy + size * 0.02);
 }
 
-/* 各玩家基地标记（小旗）：自己 + 其他在线玩家 */
+/* 各玩家基地标记（小旗）：基地位置来自共享状态 shared.game.bases
+ * （与颜色解耦），颜色取该玩家当前代表色 */
 function drawBaseMarkers() {
+  const g = window.shared.game;
+  const bases = (g && g.bases && typeof g.bases === 'object') ? g.bases : null;
+  if (bases) {
+    for (const id of Object.keys(bases)) {
+      const b = bases[id];
+      if (!b || typeof b.x !== 'number' || typeof b.y !== 'number') continue;
+      drawBaseMarker(b.x, b.y, playerColorById(id), String(id) === myOwnerId());
+    }
+    return;
+  }
+  // 兜底（无 bases 的旧状态）：用 me / guests 自带的 baseX/baseY
   if (me.baseX != null && me.baseY != null) {
     drawBaseMarker(me.baseX, me.baseY, colorOf(me.color), true);
   }
@@ -1459,15 +1657,17 @@ function drawOnePlayer(cx, cy, col, objId, colorIdx, isSelf) {
     text('YOU', cx, cy - CELL * 0.5);
   }
 
-  // 携带 Object：头顶显示对应 Emoji（其他玩家同样可见，objId 来自共享状态）
+  // 携带 Object：头顶显示对应 Emoji 小泡泡（其他玩家同样可见，objId 来自共享状态）
   if (objId) {
     const y0 = cy - (isSelf ? CELL * 0.85 : CELL * 0.68);
-    const s = isSelf ? CELL * 0.42 : CELL * 0.36;
-    drawEmojiBadge(objectEmoji(objId), cx, y0, s);
+    const s = isSelf ? CELL * 0.46 : CELL * 0.4;
+    drawEmojiBubble(objectEmoji(objId), cx, y0, s, millis(), 2.2);
   }
 }
 
-/* 屏幕边缘指向自己基地的箭头（基地在屏幕内时不画；携带 Object 时更醒目） */
+/* 屏幕边缘指向自己基地的箭头：按自己基地坐标 + 摄像机实时计算方向，
+ * 颜色用玩家代表色 + 白色描边保证对比；携带 Object 时更大更醒目；
+ * 边距避开顶部 HUD 与底部按钮区。 */
 function drawBaseArrow() {
   const bx = me.baseX, by = me.baseY;
   if (bx == null || by == null) return;
@@ -1475,29 +1675,38 @@ function drawBaseArrow() {
   // 基地的世界坐标 → 屏幕坐标
   const sx = bx * CELL + CELL / 2 - gameState.camera.x;
   const sy = by * CELL + CELL / 2 - gameState.camera.y;
-  const margin = 30;
-  if (sx > margin && sx < width - margin && sy > margin && sy < height - margin) {
+  const marginTop = 100;      // 避开 HUD 顶栏与信息行
+  const marginBot = 130;      // 避开底部按钮区
+  const marginSide = 26;
+  if (sx > marginSide && sx < width - marginSide &&
+      sy > marginTop && sy < height - marginBot) {
     return;   // 基地在屏幕内：不用箭头
   }
 
   const ang = Math.atan2(sy - height / 2, sx - width / 2);
   const tx = Math.cos(ang), ty = Math.sin(ang);
-  // 从屏幕中心沿方向与边缘矩形（含 margin）求交点
-  const kx = Math.abs(tx) < 1e-6 ? Infinity : ((tx > 0 ? width - margin : margin) - width / 2) / tx;
-  const ky = Math.abs(ty) < 1e-6 ? Infinity : ((ty > 0 ? height - margin : margin) - height / 2) / ty;
+  // 从屏幕中心沿方向与边缘矩形（含边距）求交点
+  const kx = Math.abs(tx) < 1e-6 ? Infinity : ((tx > 0 ? width - marginSide : marginSide) - width / 2) / tx;
+  const ky = Math.abs(ty) < 1e-6 ? Infinity : ((ty > 0 ? height - marginBot : marginTop) - height / 2) / ty;
   const k = Math.min(kx, ky);
   const ax = width / 2 + tx * k;
   const ay = height / 2 + ty * k;
 
   const carrying = !!me.carryingObject;
-  const pulse = carrying ? 1 + 0.15 * Math.sin(millis() / 180) : 1;
-  const s = (carrying ? 17 : 12) * pulse;
+  const pulse = carrying ? 1 + 0.12 * Math.sin(millis() / 160) : 1;
+  const s = (carrying ? 18 : 13) * pulse;
 
   push();
   translate(ax, ay);
   rotate(ang);
+  const col = colorOf(me.color);
   noStroke();
-  fill(carrying ? [255, 209, 102] : [255, 255, 255, 140]);
+  fill(col[0], col[1], col[2], carrying ? 255 : 235);
+  triangle(s, 0, -s * 0.6, -s * 0.6, -s * 0.6, s * 0.6);
+  // 白色描边：与深灰背景保持足够对比
+  noFill();
+  stroke(255, 255, 255, 220);
+  strokeWeight(2);
   triangle(s, 0, -s * 0.6, -s * 0.6, -s * 0.6, s * 0.6);
   pop();
 }
@@ -1784,6 +1993,7 @@ function bindSwipe(canvasEl) {
 // 桌面调试：方向键 / WASD（手机端没有方向按钮，用滑动 / 倾斜）
 function bindKeyboard() {
   window.addEventListener('keydown', (e) => {
+    if (howtoOpen) return;   // 说明弹窗打开时不触发移动
     const keyMap = {
       'ArrowUp': { dx: 0, dy: -1 },  'w': { dx: 0, dy: -1 }, 'W': { dx: 0, dy: -1 },
       'ArrowDown': { dx: 0, dy: 1 }, 's': { dx: 0, dy: 1 },  'S': { dx: 0, dy: 1 },
@@ -1838,12 +2048,72 @@ function bindInput() {
   bindKeyboard();
   bindJoin();
   bindReady();
+  bindHowTo();
+  bindPlayAgain();
 
   window.addEventListener('deviceorientation', onDeviceOrientation);
 
-  // 阻止 Swipe / 触摸导致页面滚动与浏览器缩放
-  document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+  // 阻止 Swipe / 触摸导致页面滚动与浏览器缩放；
+  // HOW TO PLAY 弹窗内容例外（允许纵向滚动）
+  document.addEventListener('touchmove', (e) => {
+    const ov = document.getElementById('howto-overlay');
+    if (ov && !ov.hidden && ov.contains(e.target)) return;
+    e.preventDefault();
+  }, { passive: false });
   document.addEventListener('gesturestart', (e) => e.preventDefault());
+}
+
+/* ============================================================
+ * HOW TO PLAY —— 简洁英文说明弹窗
+ * · 首次进入自动显示一次（localStorage 记录，不重复强制弹出）；
+ * · 随时点 ? 按钮查看；GOT IT 关闭；游戏进行中也能查看（不暂停比赛）；
+ * · 弹窗打开时不触发移动/抢夺（覆盖层拦截触摸，键盘亦被屏蔽）。
+ * ============================================================ */
+let howtoOpen = false;
+const HOWTO_KEY = 'decider-howto-seen';
+
+function openHowTo() {
+  const ov = document.getElementById('howto-overlay');
+  if (!ov) return;
+  ov.hidden = false;
+  howtoOpen = true;
+}
+
+function closeHowTo() {
+  const ov = document.getElementById('howto-overlay');
+  if (!ov) return;
+  ov.hidden = true;
+  howtoOpen = false;
+  try { localStorage.setItem(HOWTO_KEY, '1'); } catch (e) { /* 忽略 */ }
+}
+
+function bindHowTo() {
+  const btn = document.getElementById('btn-howto');
+  if (btn) btn.addEventListener('click', openHowTo);
+  const close = document.getElementById('btn-howto-close');
+  if (close) close.addEventListener('click', closeHowTo);
+  const ov = document.getElementById('howto-overlay');
+  if (ov) {
+    ov.addEventListener('click', (e) => {
+      if (e.target === ov) closeHowTo();   // 点背景也可关闭
+    });
+  }
+  // 首次进入自动显示一次（localStorage 未记录时）
+  let seen = false;
+  try { seen = localStorage.getItem(HOWTO_KEY) === '1'; } catch (e) { /* 忽略 */ }
+  if (!seen) {
+    setTimeout(openHowTo, 900);   // 等游戏画面就绪后再弹出
+  }
+}
+
+/* 结算面板内的 PLAY AGAIN：与底部 READY 按钮共用同一逻辑 */
+function bindPlayAgain() {
+  const btn = document.getElementById('btn-playagain');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const rb = document.getElementById('btn-ready');
+    if (rb && !rb.disabled) rb.click();
+  });
 }
 
 /* ============================================================
@@ -1983,7 +2253,7 @@ function setup() {
 }
 
 function draw() {
-  background('#181b26');   // 地图外区域的颜色
+  background(MAP_BG);       // 地图外区域与地砖间隙的颜色（中性商务灰）
 
   const dt = frameDelta(); // 帧间隔（秒），平滑动画基于 deltaTime
   updateRender(dt);        // 本机角色 + guests 的视觉坐标平滑追赶
@@ -1991,13 +2261,15 @@ function draw() {
   healObjects();            // 按本局布局补齐/清理 Object 条目
   updateGameFlow();         // 局号推进 / 倒计时锁定 / 结束 / 计分
   updateReadyFlow();        // READY 仲裁：全员就绪 → countdown → running
-  ensureMyColor();          // 连接后：分配颜色/出生点/基地、解决颜色冲突
+  applyMyBase();            // 应用共享基地分配（开赛前统一落位）
+  ensureMyColor();          // 连接后：分配颜色、解决颜色冲突
   resolveObjectConflicts(); // 裁决回滚：抢拾/被抢的输家自动放下
   assertDelivered();        // 守护已交付的 Object 不被迟到宣告复活
   updateJoinButton();
   updateReadyButton();
   updateNetStatus();        // 底部状态行：连接状态/失败提示
   updateCamera(dt);
+  updateResultsOverlay();   // ended → 显示 HTML 结算覆盖层
 
   push();
   translate(-gameState.camera.x, -gameState.camera.y); // 摄像机跟随
@@ -2012,11 +2284,11 @@ function draw() {
   drawCountdown();          // 3 / 2 / 1 / GO!
   drawHUD();
   drawStealFeedback();      // 抢夺成功/失败/冷却/距离提示
-  drawResults();            // 结束后：完整领地地图 + 排名 + 得分明细
 }
 
-// 手机旋转 / 窗口尺寸变化时重新适配画布
+// 手机旋转 / 窗口尺寸变化时重新适配画布与结算地图
 function windowResized() {
   const holder = document.getElementById('canvas-container');
   resizeCanvas(holder.clientWidth, holder.clientHeight);
+  if (resultsShown) renderResultsMap();
 }
