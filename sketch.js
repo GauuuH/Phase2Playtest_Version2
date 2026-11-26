@@ -50,8 +50,7 @@ const TILT_SIGN = 1;        // 个别设备若左右方向颠倒，改成 -1
 
 /* ---------------- 联机配置 ---------------- */
 const SHARE_CONFIG = {
-  host: '',              // ← 老师提供的 Worker URL（https://xxx.workers.dev）填这里；
-                         //   也可不改代码，用 ?shareHost=…&room=… 链接参数覆盖（p5-phone 原生支持）
+  host: 'https://p5-phone-share.npuckett.workers.dev',  // 课堂共享服务器（p5-phone-share）
   room: 'grid-walker',   // 房间名：同一房间的手机互相可见
   app: 'phase2-playtest'
 };
@@ -152,9 +151,13 @@ function ensureMyColor() {
     if (!clash) return;
   }
 
-  // 新玩家分配 / 冲突让位：找第一个空闲颜色
+  // 新玩家分配 / 冲突让位：找第一个空闲颜色（未分配 -1 和越界值不算占用）
   const used = new Set();
-  for (const g of gs) if (typeof g.color === 'number') used.add(g.color);
+  for (const g of gs) {
+    if (typeof g.color === 'number' && g.color >= 0 && g.color < PALETTE.length) {
+      used.add(g.color);
+    }
+  }
   let idx = 0;
   while (used.has(idx) && idx < PALETTE.length) idx++;
   idx = idx % PALETTE.length;
@@ -349,6 +352,8 @@ function drawPlayers() {
 
   const gs = window.guests || [];
   for (const g of gs) {
+    // 新玩家还没完成颜色分配（color 仍为 -1）时不画，避免灰圈闪烁
+    if (typeof g.color !== 'number' || g.color < 0) continue;
     drawOnePlayer({ x: g.x, y: g.y, color: colorOf(g.color) }, false);
   }
 }
