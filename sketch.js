@@ -133,6 +133,9 @@ const SHARE_CONFIG = {
 
 const MAX_PLAYERS = 7;   // 架构预留：最多 7 名玩家（先支持 2 部手机测试）
 
+/* 页面部署地址：桌面二维码在本地打开（file://）时改指这里，手机才能打开 */
+const PAGES_URL = 'https://gauuuh.github.io/Phase2Playtest_Version2/';
+
 /* 7 种玩家颜色（下标 = 颜色编号，全部设备一致） */
 const PALETTE = [
   [255, 118, 87],    // 0 珊瑚红
@@ -1117,24 +1120,50 @@ function sensorStatusText() {
 
 function connectionText() {
   if (!isShareConfigured()) return '联机: 未配置服务器';
+  if (typeof shareSetup !== 'function') return '联机: 依赖库加载失败 · 请刷新重试';
   const st = window.shareStatus;
   if (st === 'connected') return '联机: 已连接 · 在线 ' + onlineCount() + '/' + MAX_PLAYERS;
   if (st === 'connecting') return '联机: 连接中…';
-  if (st === 'error') return '联机: 连接失败 · 检查服务器';
+  if (st === 'error') return '联机: 连接失败 · 请检查网络/服务器';
   if (st === 'unsupported') return '联机: 浏览器不支持';
   return '联机: 点 JOIN 加入房间';
 }
 
-/* JOIN 按钮状态跟随连接状态变化 */
+/* 页面底部状态行（DOM）：JOIN 反馈与失败提示不依赖画布渲染 */
+function setNetStatus(text) {
+  const el = document.getElementById('net-status');
+  if (el) el.textContent = text;
+}
+
+let lastNetText = null;
+function updateNetStatus() {
+  const t = connectionText();
+  if (t !== lastNetText) {
+    lastNetText = t;
+    setNetStatus(t);
+  }
+}
+
+/* JOIN 按钮状态：跟随连接状态变化，点击后立即有反馈 */
 let lastJoinBtnState = null;
 function updateJoinButton() {
   const btn = document.getElementById('btn-join');
   if (!btn) return;
-  const state = !isShareConfigured() ? 'noconfig' : (isConnected() ? 'joined' : 'join');
+  let state;
+  if (!isShareConfigured()) state = 'noconfig';
+  else if (typeof shareSetup !== 'function') state = 'nolib';
+  else if (isConnected()) state = 'joined';
+  else if (window.shareStatus === 'connecting') state = 'connecting';
+  else if (window.shareStatus === 'error') state = 'error';
+  else state = 'join';
   if (state === lastJoinBtnState) return;
   lastJoinBtnState = state;
-  btn.disabled = state !== 'join';
-  btn.textContent = state === 'noconfig' ? '无服务器' : state === 'joined' ? '已连接 ✓' : 'JOIN';
+  if (state === 'noconfig') { btn.disabled = true; btn.textContent = '无服务器'; }
+  else if (state === 'nolib') { btn.disabled = true; btn.textContent = '库加载失败'; }
+  else if (state === 'joined') { btn.disabled = true; btn.textContent = '已连接 ✓'; }
+  else if (state === 'connecting') { btn.disabled = true; btn.textContent = '连接中…'; }
+  else if (state === 'error') { btn.disabled = false; btn.textContent = '重试 JOIN'; }
+  else { btn.disabled = false; btn.textContent = 'JOIN'; }
 }
 
 /* START / PLAY AGAIN 按钮状态跟随游戏阶段变化 */
@@ -1247,9 +1276,15 @@ function bindJoin() {
   if (!btn) return;
   btn.addEventListener('click', () => {
     if (!isShareConfigured() || isConnected()) return;
-    if (typeof shareConnect === 'function') {
-      shareConnect().catch(() => {});
+    if (typeof shareConnect !== 'function') {
+      setNetStatus('联机: 依赖库加载失败 · 请刷新重试');
+      return;
     }
+    // 点击立即反馈：连接中…
+    btn.disabled = true;
+    btn.textContent = '连接中…';
+    lastJoinBtnState = 'connecting';
+    shareConnect().catch(() => {});
   });
 }
 
@@ -1289,7 +1324,8 @@ function setup() {
   sensors.needPermission = needsSensorPermission();
 
   // 多人共享状态初始化（p5-phone Share）
-  if (isShareConfigured()) {
+  const shareLibReady = typeof shareSetup === 'function';
+  if (shareLibReady && isShareConfigured()) {
     shareSetup({
       host: SHARE_CONFIG.host,       // URL 参数 ?shareHost= 优先于这里
       room: SHARE_CONFIG.room,
@@ -1310,9 +1346,14 @@ function setup() {
         delivered: 0                // 已交付数量（自己）
       }
     });
-    if (typeof showDesktopQr === 'function') showDesktopQr();  // 桌面二维码邀请（手机端自动不显示）
-  } else {
-    // 单机模式：未配置服务器时仍可本地游玩（me / shared 为普通对象）
+    if (typeof showDesktopQr === 'function') {
+      // 只要不是线上部署地址（file:// / localhost / 局域网 IP 开发时），
+      // 二维码都指向 PAGES_URL，手机扫码才能打开
+      const hosted = location.hostname === 'gauuuh.github.io';
+      showDesktopQr(hosted ? undefined : { url: PAGES_URL });
+    }
+  } else if (shareLibReady) {
+    // 未配置服务器：单机模式（me / shared 为普通对象）
     window.me = {
       x: 12, y: 12, color: 0,
       baseX: 12, baseY: 12,
@@ -1323,6 +1364,12 @@ function setup() {
     window.shared.cells = {};
     window.shared.objects = {};
     window.shared.game = { phase: 'lobby', round: 0 };
+  } else {
+    // p5-phone 库未加载（CDN 全部失败）：降级为本地单机对象，避免崩溃
+    window.me = { x: 12, y: 12, color: 0, baseX: 12, baseY: 12, carryingObject: null, delivered: 0 };
+    window.guests = window.guests || [];
+    window.shared = { cells: {}, objects: {}, game: { phase: 'lobby', round: 0 } };
+    setNetStatus('联机: 依赖库加载失败 · 请检查网络后刷新');
   }
 
   // 摄像机初始就对正玩家
@@ -1344,6 +1391,7 @@ function draw() {
   assertDelivered();        // 守护已交付的 Object 不被迟到宣告复活
   updateJoinButton();
   updateStartButton();
+  updateNetStatus();        // 底部状态行：连接状态/失败提示
   updateCamera();
 
   push();

@@ -48,6 +48,17 @@ body {
   touch-action: none;        /* 画布上的滑动/触摸不触发页面滚动和缩放 */
 }
 
+/* 联机状态行：JOIN 点击反馈与连接失败提示都在这里可见 */
+#net-status {
+  flex: 0 0 auto;
+  width: 100%;
+  padding: 2px 16px 0;
+  text-align: center;
+  font-size: 12px;
+  color: #ffd166;
+  min-height: 16px;
+}
+
 /* ---- 操作区（JOIN + CALIBRATE + 备用方向按钮） ---- */
 #controls {
   flex: 0 0 auto;

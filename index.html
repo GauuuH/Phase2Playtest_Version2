@@ -9,16 +9,43 @@
 
   <link rel="stylesheet" href="style.css" />
 
-  <!-- p5.js -->
-  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
-
+  <!-- p5.js（CDN 多级回退：jsdelivr 在部分网络不可用） -->
+  <script>
+    window.__cdnFallbacks = {
+      'p5': [
+        'https://unpkg.com/p5@1.9.4/lib/p5.min.js',
+        'https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js'
+      ],
+      'p5-phone': [
+        'https://unpkg.com/p5-phone@1.15.0/dist/p5-phone.min.js'
+      ]
+    };
+    function __loadScript(lib, index) {
+      var list = window.__cdnFallbacks[lib];
+      if (index >= list.length) {
+        var st = document.getElementById('net-status');
+        if (st) st.textContent = '依赖库加载失败 (' + lib + ') · 请检查网络后刷新';
+        return;
+      }
+      var s = document.createElement('script');
+      s.src = list[index];
+      s.onerror = function () { __loadScript(lib, index + 1); };
+      document.head.appendChild(s);
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"
+          onerror="__loadScript('p5', 0)"></script>
   <!-- p5-phone（老师的模板同款版本）：手势锁定 + Share 多人同步 -->
-  <script src="https://cdn.jsdelivr.net/npm/p5-phone@1.15.0/dist/p5-phone.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/p5-phone@1.15.0/dist/p5-phone.min.js"
+          onerror="__loadScript('p5-phone', 0)"></script>
 </head>
 <body>
   <div id="game">
     <!-- p5 画布挂载点（只显示角色附近的地图区域） -->
     <div id="canvas-container"></div>
+
+    <!-- 联机状态行：JOIN 前/失败时在这里给出可见提示 -->
+    <div id="net-status">加载中…</div>
 
     <!-- 操作区：联机 + 校准 + 备用方向按钮 -->
     <div id="controls">
