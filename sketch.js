@@ -78,6 +78,23 @@
  *   已交付的 Object 由交付者本会话守护（assertDelivered），
  *   被迟到的抢夺宣告复活时重新写回 delivered。
  *
+ * ── 赛制：倒计时 / 计分 / 排名（已实现）──
+ *   shared.game = { phase: 'lobby'|'running'|'ended', round: 局号, startAt: 启动者时钟 }
+ *   · START：任一玩家写 { running, round+1, startAt }；PLAY AGAIN 写
+ *     { lobby, round+1 } + 清空 cells/objects；所有设备在“看到新局号”时
+ *     自我重置（各写各的 me，不替别人写）；
+ *   · 倒计时同步：每台设备在首次看到 running(N) 时以“本地收到时刻”起算
+ *     120 秒（消除设备时钟差，各设备等长计时；开赛误差 ≈ 网络延迟）；
+ *     迟到加入/重载时 startAt 已过去较久 → 改用 startAt 反推剩余时间；
+ *   · 结束：任何设备倒计时归零都写 { ended }（多台同时写同一值，
+ *     worker 收敛，先写先冻结）；所有操作在非 running 阶段被冻结；
+ *   · 计分（结束时从共享状态计算，所有设备结果一致）：
+ *     最终领地每格 +1；交付 Object 每个 +30；结束时仍携带每个 +15；
+ *     比赛中不显示任何人的总分/排名，结束后才显示完整地图与明细；
+ *   · 并发冲突（同时 START / 同时结束 / 同时 PLAY AGAIN）：
+ *     同 key 覆盖 + 局号去重（每台设备每个局号只重置/锁定一次），
+ *     最终都收敛到 worker 的同一份 game 状态。
+ *
  * ── 操作方式（手机） ──
  *   · Swipe：画面上滑/下滑，每次移动一格
  *   · Tilt ：左右倾斜横向移动（死区 + 定间隔），CALIBRATE 校准中立角
@@ -100,6 +117,12 @@ const SWIPE_DIST   = 30;    // 滑动判定距离（px）
 const TILT_DEADZONE = 5;    // 倾斜死区（°），防止手抖误触发
 const TILT_INTERVAL = 220;  // 倾斜越过死区后的固定移动间隔（ms）
 const TILT_SIGN = 1;        // 个别设备若左右方向颠倒，改成 -1
+
+/* ---------------- 赛制配置 ---------------- */
+let GAME_DURATION = 120000;  // 每局时长（ms）= 120 秒；测试时可临时改短
+const SCORE_CELL = 1;        // 最终领地每格 1 分
+const SCORE_DELIVERED = 30;  // 交付一个 Object 30 分
+const SCORE_CARRIED = 15;    // 结束时仍携带一个 Object 15 分
 
 /* ---------------- 联机配置 ---------------- */
 const SHARE_CONFIG = {
@@ -148,6 +171,15 @@ const gameState = {
   camera: { x: 0, y: 0 }   // 摄像机左上角的世界坐标（像素）
 };
 
+/* ---------------- 赛制本地状态（不同步，纯本机） ---------------- */
+const game = {
+  localRound: -1,       // 本机已锁定的局号
+  lastPhase: null,      // 本机上次看到的阶段（用于锁定 running 的进入沿）
+  localStartAt: 0,      // 本机倒计时起点（本地时钟，收到 running 时锁定）
+  lastResetRound: -1,   // 已执行自我重置的局号（每局只重置一次）
+  scores: null          // 结束后每帧从共享状态重算（冻结期保持最新）
+};
+
 /* ---------------- 倾斜传感器状态 ---------------- */
 const sensors = {
   needPermission: false,   // iOS 13+：需用户手势请求授权
@@ -191,11 +223,157 @@ function onlineCount() {
 }
 
 /* ============================================================
+ * 赛制 —— 阶段 / 倒计时 / 计分
+ * ============================================================ */
+function gamePhase() {
+  const g = window.shared.game;
+  if (!g) return 'lobby';
+  return g.phase === 'running' ? 'running' : g.phase === 'ended' ? 'ended' : 'lobby';
+}
+
+function gameRound() {
+  const g = window.shared.game;
+  return g && typeof g.round === 'number' ? g.round : 0;
+}
+
+function gameIsRunning() {
+  return gamePhase() === 'running';
+}
+
+function remainingMs() {
+  if (!gameIsRunning()) return GAME_DURATION;
+  if (game.localStartAt > 0) {
+    return Math.max(0, GAME_DURATION - (Date.now() - game.localStartAt));
+  }
+  const g = window.shared.game;
+  if (g && typeof g.startAt === 'number') {
+    return Math.max(0, GAME_DURATION - (Date.now() - g.startAt));
+  }
+  return GAME_DURATION;
+}
+
+// 自我重置（PLAY AGAIN / 新局）：各设备只改自己的 me
+function resetMyPlayer() {
+  // 把带走的 Object 放回地面（重载/迟到加入的孤儿 Object 保护）
+  if (me.carryingObject) {
+    const st = window.shared.objects && window.shared.objects[me.carryingObject];
+    if (st && st.state === 'carried' && st.by === myOwnerId()) {
+      window.shared.objects[me.carryingObject] = { state: 'ground' };
+    }
+  }
+  if (me.baseX != null && me.baseY != null) {
+    me.x = me.baseX;   // 回到自己的基地
+    me.y = me.baseY;
+  }
+  me.carryingObject = null;
+  me.delivered = 0;
+  steal.deliveredByMe.clear();
+  game.scores = null;
+  game.localStartAt = 0;
+}
+
+// 每帧调用：局号推进 / 倒计时锁定 / 结束 / 计分
+function updateGameFlow() {
+  if (!window.shared.game) window.shared.game = { phase: 'lobby', round: 0 };
+  const g = window.shared.game;
+  const round = typeof g.round === 'number' ? g.round : 0;
+  const phase = gamePhase();
+
+  // 新一局（lobby 或 running）→ 每台设备自我重置一次（同时处理
+  // START 与 PLAY AGAIN 的竞态：以最终看到的局号为准，只重置一次）
+  if (phase !== 'ended' && round !== game.lastResetRound) {
+    game.lastResetRound = round;
+    resetMyPlayer();
+  }
+
+  // 进入 running（以“阶段沿”为准，而不是局号：PLAY AGAIN 换局后
+  // START 沿用同一局号，阶段从 lobby → running 也必须重新锁定）
+  if (phase === 'running' && game.lastPhase !== 'running') {
+    game.lastPhase = 'running';
+    game.localRound = round;
+    // 正常开赛：以“本地收到时刻”起算，消除设备时钟差（各设备等长计时）；
+    // 迟到加入 / 重载：startAt 已过去较久 → 用 startAt 反推剩余时间
+    const late = typeof g.startAt === 'number' && Date.now() - g.startAt > 1500;
+    game.localStartAt = late ? g.startAt : Date.now();
+    // 开赛瞬间：占下自己的出生格（基地）。捕获“基地格”而不是“当前格”，
+    // 不受帧时机影响——即使玩家在 latch 前已移动，出生格也自动归自己，
+    // 路径格由移动本身完成占地。
+    if (me.baseX != null && me.baseY != null) captureCell(me.baseX, me.baseY);
+  } else if (phase !== 'running') {
+    game.lastPhase = phase;
+    game.localRound = round;
+  }
+
+  // 倒计时归零 → 写 ended（多台同时写同一值，worker 收敛，先写先冻结）
+  const online = !isShareConfigured() || isConnected();
+  if (phase === 'running' && online && remainingMs() <= 0) {
+    window.shared.game.phase = 'ended';
+  }
+
+  // 结束后每帧从共享状态重算（冻结期若有迟到的裁决补丁，结果保持最新）
+  if (phase === 'ended') {
+    game.scores = computeScores();
+  }
+}
+
+function scoreOf(p) {
+  let cells = 0;
+  const cmap = window.shared.cells || {};
+  for (const k in cmap) {
+    if (cmap[k] && cmap[k].o === p.id) cells++;
+  }
+  let carried = 0;
+  const objs = window.shared.objects || {};
+  for (const k in objs) {
+    const o = objs[k];
+    if (o && o.state === 'carried' && o.by === p.id) carried++;
+  }
+  const delivered = typeof p.delivered === 'number' ? p.delivered : 0;
+  return {
+    id: p.id,
+    color: typeof p.color === 'number' ? p.color : 0,
+    cells,
+    delivered,
+    carried,
+    total: cells * SCORE_CELL + delivered * SCORE_DELIVERED + carried * SCORE_CARRIED
+  };
+}
+
+function computeScores() {
+  const list = [];
+  list.push(scoreOf({
+    id: myOwnerId(),
+    color: typeof me.color === 'number' ? me.color : 0,
+    delivered: me.delivered
+  }));
+  const gs = window.guests || [];
+  for (const g of gs) {
+    if (typeof g.color !== 'number' || g.color < 0) continue;
+    list.push(scoreOf({
+      id: String(g.id),
+      color: g.color,
+      delivered: g.delivered
+    }));
+  }
+  list.sort((a, b) => b.total - a.total || a.color - b.color);   // 同分按颜色下标稳定排序，各设备排名一致
+  return list;
+}
+
+// HUD 用：阶段 / 倒计时
+function gameStatusText() {
+  const p = gamePhase();
+  if (p === 'running') return '时间: ' + Math.ceil(remainingMs() / 1000) + 's';
+  if (p === 'ended') return '时间: 已结束';
+  return '时间: 等待开始';
+}
+
+/* ============================================================
  * 移动逻辑 —— 唯一入口，与输入方式无关
  * 只写自己的 me；边界检查在这里做（0 ~ GRID-1）。
  * 每次移动只处理“实际进入”的格子：顶墙没动时不触发占地/拾取。
  * ============================================================ */
 function moveMe(dx, dy) {
+  if (!gameIsRunning()) return;   // 比赛未开始 / 已结束：冻结，不能移动
   const nx = constrain(me.x + dx, 0, GRID - 1);
   const ny = constrain(me.y + dy, 0, GRID - 1);
   if (nx === me.x && ny === me.y) return;   // 没动（顶墙）：不占地、不拾取
@@ -214,7 +392,8 @@ function moveMe(dx, dy) {
  *   · 携带 Object 的玩家移动不占领、不抢占任何格子；原有领地保留
  * ============================================================ */
 function captureCell(x, y) {
-  if (me.carryingObject) return;   // 携带 Object 时不能占领
+  if (!gameIsRunning()) return;   // 比赛未开始 / 已结束：不占地
+  if (me.carryingObject) return;  // 携带 Object 时不能占领
 
   const key  = x + ',' + y;
   const mine = myOwnerId();
@@ -383,8 +562,12 @@ function trySteal() {
   }
   steal.cooldownUntil = now + STEAL_COOLDOWN;   // 每次尝试都进入冷却
 
-  if (!isConnected()) {
+  if (isShareConfigured() && !isConnected()) {
     setStealFeedback('未连接房间', FEEDBACK_FAIL);
+    return;
+  }
+  if (!gameIsRunning()) {
+    setStealFeedback('比赛未进行', FEEDBACK_FAIL);
     return;
   }
   if (me.carryingObject) {
@@ -441,6 +624,62 @@ function drawStealFeedback() {
   textSize(15);
   textAlign(CENTER, CENTER);
   text(steal.feedback.text, cx, cy);
+}
+
+/* 结算界面（仅 ended 阶段）：完整领地小地图 + 排名 + 得分明细 */
+function drawResults() {
+  if (gamePhase() !== 'ended') return;
+  const sc = game.scores || [];
+
+  // 遮罩
+  noStroke();
+  fill(0, 0, 0, 0.66);
+  rect(0, 0, width, height);
+
+  // 完整 24×24 领地小地图（按主人颜色缩放绘制）
+  const mapSize = Math.min(width, height) * 0.36;
+  const cs = mapSize / GRID;
+  const mx = (width - mapSize) / 2;
+  const my = 22;
+  for (let y = 0; y < GRID; y++) {
+    for (let x = 0; x < GRID; x++) {
+      const c = cellOwner(x, y);
+      if (c) {
+        const col = PALETTE[(typeof c.c === 'number' && c.c >= 0 ? c.c : 0) % PALETTE.length];
+        fill(col[0], col[1], col[2]);
+      } else {
+        fill(52, 60, 50);
+      }
+      rect(mx + x * cs, my + y * cs, cs + 0.6, cs + 0.6);
+    }
+  }
+  noFill();
+  stroke(255, 255, 255, 80);
+  strokeWeight(1);
+  rect(mx, my, mapSize, mapSize);
+
+  // 排名与明细
+  textAlign(LEFT, TOP);
+  let ty = my + mapSize + 18;
+  textSize(17);
+  fill(255, 209, 102);
+  text('游戏结束 · 排名', 16, ty);
+  ty += 30;
+  for (let i = 0; i < sc.length; i++) {
+    const p = sc[i];
+    const col = PALETTE[p.color % PALETTE.length];
+    const isMe = p.id === myOwnerId();
+    noStroke();
+    fill(col[0], col[1], col[2]);
+    circle(24, ty + 6, 10);
+    fill(255);
+    textSize(13);
+    text((i + 1) + '. ' + (isMe ? '我' : 'P' + (p.color + 1)) + '  ' + p.total + ' 分', 40, ty);
+    fill(205, 205, 215);
+    textSize(11);
+    text('领地 ' + p.cells + ' + 交付 ' + p.delivered + '×30 + 携带 ' + p.carried + '×15', 40, ty + 17);
+    ty += 38;
+  }
 }
 
 // 双指同时点击画布（< 350ms 内两根手指都按下）→ 触发一次抢夺尝试
@@ -830,15 +1069,16 @@ function drawBaseArrow() {
   pop();
 }
 
-// HUD：坐标 + 倾斜 + 联机 + 占地/交付（开发测试用，无全局排名）
+// HUD：坐标 + 倾斜 + 联机 + 占地/交付 + 时间（开发测试用，无全局排名）
 function drawHUD() {
-  let line5 = '占地 ' + myCellCount() + ' · 交付 ' + (typeof me.delivered === 'number' ? me.delivered : 0);
-  if (me.carryingObject) line5 += ' · 携带 ' + me.carryingObject;
+  let line4 = '占地 ' + myCellCount() + ' · 交付 ' + (typeof me.delivered === 'number' ? me.delivered : 0);
+  if (me.carryingObject) line4 += ' · 携带 ' + me.carryingObject;
   const lines = [
     'X ' + me.x + ' · Y ' + me.y,
     sensorStatusText(),
     connectionText(),
-    line5
+    line4,
+    gameStatusText()
   ];
 
   textSize(14);
@@ -895,6 +1135,42 @@ function updateJoinButton() {
   lastJoinBtnState = state;
   btn.disabled = state !== 'join';
   btn.textContent = state === 'noconfig' ? '无服务器' : state === 'joined' ? '已连接 ✓' : 'JOIN';
+}
+
+/* START / PLAY AGAIN 按钮状态跟随游戏阶段变化 */
+let lastStartBtnState = null;
+function updateStartButton() {
+  const btn = document.getElementById('btn-start');
+  if (!btn) return;
+  const online = !isShareConfigured() || isConnected();
+  const state = !online ? 'noconn' : gamePhase();
+  if (state === lastStartBtnState) return;
+  lastStartBtnState = state;
+  if (state === 'noconn') { btn.disabled = true; btn.textContent = '未连接'; }
+  else if (state === 'running') { btn.disabled = true; btn.textContent = '进行中…'; }
+  else if (state === 'ended') { btn.disabled = false; btn.textContent = 'PLAY AGAIN'; }
+  else { btn.disabled = false; btn.textContent = 'START'; }
+}
+
+/* START（lobby → running）/ PLAY AGAIN（ended → 新 lobby + 清空地图与物品） */
+function bindStart() {
+  const btn = document.getElementById('btn-start');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const p = gamePhase();
+    if (p === 'running') return;
+    const round = gameRound();
+    if (p === 'lobby') {
+      // 任一玩家启动：沿用当前局号，写 running + 启动者时钟
+      window.shared.game = { phase: 'running', round: round, startAt: Date.now() };
+    } else {
+      // PLAY AGAIN：写 lobby + 新局号，并清空地图与物品（各设备自行重置 me）
+      window.shared.game = { phase: 'lobby', round: round + 1 };
+      window.shared.cells = {};
+      window.shared.objects = {};
+      for (const o of OBJECTS) window.shared.objects[o.id] = { state: 'ground' };
+    }
+  });
 }
 
 /* ============================================================
@@ -984,6 +1260,7 @@ function bindInput() {
   bindDpad();
   bindKeyboard();
   bindJoin();
+  bindStart();
 
   const calBtn = document.getElementById('btn-calibrate');
   if (calBtn) calBtn.addEventListener('click', onCalibratePress);
@@ -1024,7 +1301,8 @@ function setup() {
           o2: { state: 'ground' },
           o3: { state: 'ground' },
           o4: { state: 'ground' }
-        }
+        },
+        game: { phase: 'lobby', round: 0 }   // 赛制：lobby / running / ended
       },
       me: {
         x: 12, y: 12, color: -1,    // color -1 = 未分配，连接后自动分配
@@ -1044,6 +1322,7 @@ function setup() {
     window.guests = window.guests || [];
     window.shared.cells = {};
     window.shared.objects = {};
+    window.shared.game = { phase: 'lobby', round: 0 };
   }
 
   // 摄像机初始就对正玩家
@@ -1059,10 +1338,12 @@ function draw() {
 
   updateTilt();
   healObjects();            // 补齐缺失的 Object 条目
+  updateGameFlow();         // 局号推进 / 倒计时 / 结束 / 计分
   ensureMyColor();          // 连接后：分配颜色/出生点/基地、解决颜色冲突
   resolveObjectConflicts(); // 裁决回滚：抢拾/被抢的输家自动放下
   assertDelivered();        // 守护已交付的 Object 不被迟到宣告复活
   updateJoinButton();
+  updateStartButton();
   updateCamera();
 
   push();
@@ -1077,6 +1358,7 @@ function draw() {
   drawBaseArrow();          // 屏幕边缘指向自己基地的箭头
   drawHUD();
   drawStealFeedback();      // 抢夺成功/失败/冷却/距离提示
+  drawResults();            // 结束后：完整领地地图 + 排名 + 得分明细
 }
 
 // 手机旋转 / 窗口尺寸变化时重新适配画布

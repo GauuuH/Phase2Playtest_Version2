@@ -47,6 +47,14 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 - **同时拾取/抢夺**：p5-phone 1.15.0 / 现有 Worker 没有 CAS 或服务端裁决 API；采用「宣告 + 回滚」——worker 按到达顺序定出唯一携带者，输家自动放下（最终一致，有亚秒级双携带过渡窗口，非严格互斥）。已交付的 Object 由交付者守护，不被迟到的抢夺宣告复活。详见 `sketch.js` 头部注释
 - `claimObject(objId)` 即所有权转移入口（拾取与抢夺共用）
 
+### 赛制（倒计时 / 计分 / 排名）
+
+- 房间内任一玩家点 **START** 开始比赛（大厅阶段不能移动/占地/拾取/抢夺）
+- 每局 120 秒：倒计时由共享状态驱动（`shared.game = { phase, round, startAt }`），各设备在收到 running 时以本地时刻锁定起点、等长计时；任一台倒计时归零写 ended，所有设备同时冻结
+- 结束后：完整领地小地图 + 排名 + 得分明细（领地每格 +1，交付 Object 每个 +30，结束时仍携带每个 +15）；比赛中不显示任何人的总分/排名
+- **PLAY AGAIN**：清空地图与物品、所有玩家回基地并清空携带/交付数，回到大厅
+- 同时 START / 结束 / PLAY AGAIN：同 key 覆盖 + 局号去重（每局每台只重置/锁定一次），收敛到服务器同一份状态
+
 ### 配置共享服务器（必需，一次性）
 
 p5-phone 的 Share 需要本项目自己部署的 Worker（免费 Cloudflare 账号）：
