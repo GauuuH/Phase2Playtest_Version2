@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#181b26" />
+  <title>格子漫游 · Grid Walker</title>
+
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- p5.js -->
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
+
+  <!-- 将来接入 p5-phone-share 多人同步时取消注释（p5-phone 的 Share 功能）:
+  <script src="https://cdn.jsdelivr.net/npm/p5-phone@1.16.1/dist/p5-phone.min.js"></script>
+  -->
+</head>
+<body>
+  <div id="game">
+    <!-- p5 画布挂载点（只显示角色附近的地图区域） -->
+    <div id="canvas-container"></div>
+
+    <!-- 屏幕方向按钮：每按一次移动一格 -->
+    <div id="controls">
+      <button id="btn-up"    class="dir-btn" aria-label="上">▲</button>
+      <button id="btn-left"  class="dir-btn" aria-label="左">◀</button>
+      <button id="btn-down"  class="dir-btn" aria-label="下">▼</button>
+      <button id="btn-right" class="dir-btn" aria-label="右">▶</button>
+    </div>
+  </div>
+
+  <script src="sketch.js"></script>
+</body>
+</html>
