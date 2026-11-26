@@ -118,6 +118,30 @@ window.addEventListener('error', (e) => {
   } catch (x) { /* 忽略 */ }
 });
 
+/* ---------------- 诊断模式 (?debug=local 或 #debug=local) ----------------
+ * 完全排除联机影响：不调用 shareSetup()/shareConnect()、不访问 Worker；
+ * isShareConfigured() 返回 false → 所有逻辑自然走本地单机分支。
+ * 状态行显示帧计数（证明 draw() 在跑），JOIN/CALIBRATE 点击给出明确反馈。
+ * 注意：命名避开 p5-phone 的全局函数 debug()（否则会解析冲突）。 */
+const debugState = {
+  mode: false,
+  message: ''
+};
+
+function isDebugLocal() {
+  try {
+    if (sessionStorage.getItem('debug') === 'local') return true;
+  } catch (e) { /* 忽略 */ }
+  try {
+    if (new URLSearchParams(location.search).get('debug') === 'local') return true;
+  } catch (e) { /* 忽略 */ }
+  try {
+    if (/debug=local/.test(location.hash)) return true;
+  } catch (e) { /* 忽略 */ }
+  return false;
+}
+debugState.mode = isDebugLocal();
+
 /* ---------------- 世界配置 ---------------- */
 const GRID   = 24;            // 24 × 24 格子地图
 const CELL   = 40;            // 每格像素
@@ -214,6 +238,7 @@ const sensors = {
  * 联机工具
  * ============================================================ */
 function isShareConfigured() {
+  if (debugState.mode) return false;   // 诊断模式：不联机、不访问服务器
   if (SHARE_CONFIG.host && SHARE_CONFIG.host.trim()) return true;
   try { return !!new URLSearchParams(location.search).get('shareHost'); }
   catch (e) { return false; }
@@ -831,6 +856,26 @@ function calibrateTilt() {
 // CALIBRATE 按钮：iPhone（iOS 13+）通过按钮请求传感器授权；
 // 授权成功直接以当前姿态校准；被拒绝则 HUD 提示，不报错。
 function onCalibratePress() {
+  if (debugState.mode) {
+    // 诊断模式：验证按钮事件 + 尝试请求传感器权限（与联机无关）
+    setDebugMessage('CALIBRATE 按钮正常');
+    if (needsSensorPermission()) {
+      setDebugMessage('CALIBRATE 按钮正常 · 请求传感器权限…');
+      DeviceOrientationEvent.requestPermission()
+        .then((state) => {
+          setDebugMessage('CALIBRATE 按钮正常 · 传感器权限: ' + state);
+          if (state === 'granted') calibrateTilt();
+        })
+        .catch((err) => {
+          setDebugMessage('CALIBRATE 按钮正常 · 权限请求失败: ' + (err && err.message ? err.message : err));
+        });
+    } else {
+      setDebugMessage('CALIBRATE 按钮正常 · 无需授权(Android/桌面)');
+      calibrateTilt();
+    }
+    return;
+  }
+
   tryLockPortrait();
 
   if (needsSensorPermission() && !sensors.permissionAsked) {
@@ -1131,6 +1176,7 @@ function sensorStatusText() {
 }
 
 function connectionText() {
+  if (debugState.mode) return '联机: 诊断模式 · 不访问服务器';
   if (!isShareConfigured()) return '联机: 未配置服务器';
   if (typeof shareSetup !== 'function') return '联机: 依赖库加载失败 · 请刷新重试';
   const st = window.shareStatus;
@@ -1147,9 +1193,23 @@ function setNetStatus(text) {
   if (el) el.textContent = text;
 }
 
+function netStatusText() {
+  if (debugState.mode) {
+    return '诊断模式 · 帧 ' + frameCount + (debugState.message ? ' · ' + debugState.message : '');
+  }
+  return connectionText();
+}
+
+// 诊断模式下按钮反馈要立即可见（updateNetStatus 按 30 帧节流，不适合即时反馈）
+function setDebugMessage(text) {
+  debugState.message = text;
+  setNetStatus(netStatusText());
+}
+
 let lastNetText = null;
 function updateNetStatus() {
-  const t = connectionText();
+  if (debugState.mode && frameCount % 30 !== 0 && lastNetText !== null) return;   // 诊断模式节流
+  const t = netStatusText();
   if (t !== lastNetText) {
     lastNetText = t;
     setNetStatus(t);
@@ -1162,7 +1222,8 @@ function updateJoinButton() {
   const btn = document.getElementById('btn-join');
   if (!btn) return;
   let state;
-  if (!isShareConfigured()) state = 'noconfig';
+  if (debugState.mode) state = 'debugjoin';
+  else if (!isShareConfigured()) state = 'noconfig';
   else if (typeof shareSetup !== 'function') state = 'nolib';
   else if (isConnected()) state = 'joined';
   else if (window.shareStatus === 'connecting') state = 'connecting';
@@ -1170,7 +1231,8 @@ function updateJoinButton() {
   else state = 'join';
   if (state === lastJoinBtnState) return;
   lastJoinBtnState = state;
-  if (state === 'noconfig') { btn.disabled = true; btn.textContent = '无服务器'; }
+  if (state === 'debugjoin') { btn.disabled = false; btn.textContent = 'JOIN'; }
+  else if (state === 'noconfig') { btn.disabled = true; btn.textContent = '无服务器'; }
   else if (state === 'nolib') { btn.disabled = true; btn.textContent = '库加载失败'; }
   else if (state === 'joined') { btn.disabled = true; btn.textContent = '已连接 ✓'; }
   else if (state === 'connecting') { btn.disabled = true; btn.textContent = '连接中…'; }
@@ -1287,6 +1349,11 @@ function bindJoin() {
   const btn = document.getElementById('btn-join');
   if (!btn) return;
   btn.addEventListener('click', () => {
+    if (debugState.mode) {
+      // 诊断模式：不调用 shareConnect、不访问 Worker，只验证按钮与事件
+      setDebugMessage('JOIN 按钮正常');
+      return;
+    }
     if (!isShareConfigured() || isConnected()) return;
     if (typeof shareConnect !== 'function') {
       setNetStatus('联机: p5-phone 未加载 · 仅单机模式');
@@ -1418,7 +1485,7 @@ function setup() {
       window.me = { x: 12, y: 12, color: 0, baseX: 12, baseY: 12, carryingObject: null, delivered: 0 };
       window.guests = window.guests || [];
       window.shared = { cells: {}, objects: {}, game: { phase: 'lobby', round: 0 } };
-      setNetStatus('联机: 依赖库加载失败 · 请检查网络后刷新');
+      setNetStatus(debugState.mode ? '诊断模式 · 初始化完成 · 不访问服务器' : '联机: 依赖库加载失败 · 请检查网络后刷新');
     }
   } catch (err) {
     reportInitError('联机', err);
@@ -1437,7 +1504,8 @@ function setup() {
     reportInitError('摄像机', err);
   }
 
-  setNetStatus(connectionText());
+  if (debugState.mode) debugState.message = '初始化完成 · 不访问服务器';
+  setNetStatus(netStatusText());
 }
 
 function draw() {

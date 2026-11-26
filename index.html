@@ -109,6 +109,15 @@
       status('加载中…');
       loadChain('p5')
         .then(function () {
+          // 诊断模式（?debug=local / #debug=local / sessionStorage debug=local）：
+          // 跳过 p5-phone，彻底排除联机库与 CDN 的影响
+          var isDebug = false;
+          try { isDebug = sessionStorage.getItem('debug') === 'local'; } catch (e) {}
+          if (!isDebug) isDebug = /[?&]debug=local/.test(location.search) || /debug=local/.test(location.hash);
+          if (isDebug) {
+            status('诊断模式: 跳过 p5-phone · 不访问服务器');
+            return Promise.resolve();
+          }
           return loadChain('p5-phone').catch(function () {
             status('警告: p5-phone 未加载 · 仅单机模式，联机不可用');
           });
