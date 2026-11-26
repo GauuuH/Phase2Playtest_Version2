@@ -1,32 +1,29 @@
 /* ============================================================
  * 格子漫游 · Grid Walker —— sketch.js
  *
- * 24×24 格子地图 + 摄像机跟随（Camera Follow）
- * 手机竖屏，屏幕方向按钮控制，每按一次移动一格
+ * 24×24 格子地图 + Camera Follow（只跟随自己的角色）
+ * 手机竖屏游戏，电脑仅用于开发调试
  *
- * ── 为将来接入 p5-phone-share（p5-phone 的 Share 功能）预留的结构 ──
- * 本文件刻意把「数据 / 逻辑 / 渲染 / 输入」分层：
+ * ── 架构（为将来 p5-phone-share 多人同步预留） ──
+ * 本游戏没有“电脑 Host 大屏”：
+ *   未来每位玩家都在自己的手机上运行同一个页面，
+ *   显示同一张共享地图，摄像机只跟随自己的角色。
+ * 多人接入时：
+ *   - gameState.players 会放进所有玩家的位置（现在只有 me）；
+ *   - 手机间用 p5-phone-share 的 shared 状态 / shareEmit 同步按键，
+ *     每台手机收到别人的按键后调用同一个 movePlayer(id, dx, dy)；
+ *   - 渲染与摄像机代码不需要改动（drawPlayers 已按多人循环写）。
+ * 电脑在本项目中仅用于开发与调试（键盘 WASD / 方向键）。
  *
- *   gameState      —— 游戏的唯一数据源（所有玩家位置、摄像机）。
- *                     将来多人时把每个玩家都放进 gameState.players，
- *                     Host（大屏）负责绘制与同步，手机页面只做手柄。
- *
- *   movePlayer()   —— 唯一的移动入口：只改数据，不碰输入和渲染。
- *                     现在方向按钮直接调用它；将来改成：
- *                       手机：shareEmit('move', { dx, dy }) 发送按键；
- *                       Host：在 shareEvent(name, data, from) 回调里
- *                            收到后调用 movePlayer(from, data.dx, data.dy)。
- *                     其余代码（渲染、摄像机）完全不用改。
- *
- *   drawWorld() / drawPlayers() —— 渲染与逻辑分离，
- *                     Host 大屏可原样复用这些绘制函数。
- *
- * 将来接入步骤（现在不需要做）：
- *   1. index.html 里取消 p5-phone <script> 的注释；
- *   2. setup() 中加入：
- *        shareSetup({ host: 'https://你的.workers.dev', room: 'grid-walker' });
- *        enableShareTap();          // 手机点一下屏幕加入房间
- *   3. 用 shareEmit / shareEvent 把按钮按键转发给 Host。
+ * ── 操作方式（手机） ──
+ *   · Swipe：在游戏画面上向上/向下滑动，每次移动一格
+ *   · Tilt ：左右倾斜手机横向移动；越过死区立即走一格，
+ *            之后按固定间隔连续移动，回到中立角度停止
+ *   · CALIBRATE：把当前握持姿态设为倾斜中立角
+ *            （iPhone 上同时通过按钮请求方向传感器授权）
+ *   · 屏幕方向按钮：备用操作，保证不支持倾斜的设备也能玩
+ * ── 操作方式（桌面调试） ──
+ *   · 方向键 / WASD
  * ============================================================ */
 
 'use strict';
@@ -37,6 +34,12 @@ const CELL   = 40;            // 每格像素
 const WORLD_W = GRID * CELL;  // 地图总宽 960px
 const WORLD_H = GRID * CELL;  // 地图总高 960px（大于手机屏幕）
 
+/* ---------------- 操作配置 ---------------- */
+const SWIPE_DIST   = 30;    // 滑动判定距离（px），小于此距离不算滑动
+const TILT_DEADZONE = 5;    // 倾斜死区（°），|当前 - 中立| < 死区不移动，防止手抖误触发
+const TILT_INTERVAL = 220;  // 倾斜越过死区后的固定移动间隔（ms）
+const TILT_SIGN = 1;        // 个别设备若左右方向颠倒，改成 -1
+
 /* ---------------- 游戏状态（未来多人同步的唯一数据源） ---------------- */
 const gameState = {
   players: {
@@ -44,6 +47,21 @@ const gameState = {
     me: { x: GRID / 2, y: GRID / 2, color: [255, 118, 87] }
   },
   camera: { x: 0, y: 0 }   // 摄像机左上角的世界坐标（像素）
+};
+
+/* ---------------- 倾斜传感器状态 ---------------- */
+const sensors = {
+  needPermission: false,   // iOS 13+：需用户手势请求授权
+  permissionAsked: false,
+  denied: false,           // 授权被拒绝 → HUD 提示，不报错
+  available: false,        // 是否收到过传感器数据
+  latest: null,            // 最近一次左右倾斜角度（°）
+  neutral: null,           // 校准后的中立角度（°）
+  calibrated: false,
+  calibratePressed: false,
+  pendingCalibrate: false, // 按下校准时还没数据 → 等第一条数据到达再校准
+  dir: 0,                  // 当前倾斜方向：-1 左 / 0 停 / 1 右
+  lastMoveAt: 0            // 上次倾斜移动的时间（millis）
 };
 
 /* ============================================================
@@ -58,7 +76,7 @@ function movePlayer(id, dx, dy) {
 }
 
 /* ============================================================
- * 摄像机 —— Camera Follow
+ * 摄像机 —— Camera Follow（只跟随自己的角色）
  * 目标位置：让玩家保持在屏幕中央；
  * 靠近地图边缘时钳制摄像机，不显示地图外的区域；
  * 地图比屏幕小时则居中显示地图。
@@ -85,6 +103,113 @@ function updateCamera() {
   // 平滑跟随，让移动观感更舒服
   cam.x = lerp(cam.x, t.x, 0.18);
   cam.y = lerp(cam.y, t.y, 0.18);
+}
+
+/* ============================================================
+ * 倾斜传感器 —— 权限 / 校准 / 死区 / 定间隔移动
+ * ============================================================ */
+function needsSensorPermission() {
+  return (
+    typeof DeviceOrientationEvent !== 'undefined' &&
+    typeof DeviceOrientationEvent.requestPermission === 'function'
+  );
+}
+
+// 当前屏幕方向：0 竖屏，90 / -90 横屏
+// 新 API 用 screen.orientation.angle；旧 iOS Safari 用 window.orientation
+function screenAngle() {
+  if (window.screen && screen.orientation && typeof screen.orientation.angle === 'number') {
+    return screen.orientation.angle;
+  }
+  return typeof window.orientation === 'number' ? window.orientation : 0;
+}
+
+function onDeviceOrientation(e) {
+  const g = e.gamma, b = e.beta;
+  if (g == null || b == null || isNaN(g) || isNaN(b)) return;
+
+  // 竖屏：gamma 即左右倾斜（正值 = 向右）；
+  // 横屏：旋转轴对调，改用 beta（尽力而为，本游戏以竖屏为主）
+  const angle = Math.abs(screenAngle());
+  const tilt = (angle === 90 || angle === 270) ? -b : g;
+
+  sensors.latest = tilt * TILT_SIGN;
+  sensors.available = true;
+
+  // 按下校准时还没有数据 → 现在用第一条数据完成校准
+  if (sensors.pendingCalibrate) {
+    sensors.pendingCalibrate = false;
+    sensors.neutral = tilt * TILT_SIGN;
+    sensors.calibrated = true;
+    sensors.dir = 0;
+  }
+}
+
+function calibrateTilt() {
+  sensors.calibratePressed = true;
+  if (sensors.latest != null) {
+    sensors.neutral = sensors.latest;   // 当前握持姿态 = 中立角度
+    sensors.calibrated = true;
+    sensors.dir = 0;
+  } else {
+    sensors.pendingCalibrate = true;    // 等第一条传感器数据
+  }
+}
+
+// CALIBRATE 按钮：
+//  · iPhone（iOS 13+）需要用户手势请求传感器授权 → 通过按钮完成，
+//    授权成功后直接以当前姿态校准；被拒绝则 HUD 提示，不报错
+//  · Android / 桌面无需授权 → 直接校准
+function onCalibratePress() {
+  tryLockPortrait();   // 借用户手势尽力锁定竖屏（不支持则静默失败）
+
+  if (needsSensorPermission() && !sensors.permissionAsked) {
+    sensors.permissionAsked = true;
+    DeviceOrientationEvent.requestPermission()
+      .then((state) => {
+        if (state === 'granted') {
+          sensors.denied = false;
+          calibrateTilt();
+        } else {
+          sensors.denied = true;
+        }
+      })
+      .catch(() => { sensors.denied = true; });
+  } else {
+    calibrateTilt();
+  }
+}
+
+// 每帧调用：越过死区立即移动一格，之后按固定间隔连续移动；回到中立停止
+function updateTilt() {
+  if (!sensors.calibrated || sensors.latest == null) return;
+  const d = sensors.latest - sensors.neutral;
+  const dir = d > TILT_DEADZONE ? 1 : d < -TILT_DEADZONE ? -1 : 0;
+
+  if (dir === 0) {
+    sensors.dir = 0;
+    return;
+  }
+
+  const now = millis();
+  if (dir !== sensors.dir) {
+    sensors.dir = dir;
+    sensors.lastMoveAt = now;
+    movePlayer('me', dir, 0);            // 刚越过阈值：立即走一格
+  } else if (now - sensors.lastMoveAt >= TILT_INTERVAL) {
+    sensors.lastMoveAt = now;
+    movePlayer('me', dir, 0);            // 保持倾斜：按固定间隔走格
+  }
+}
+
+// 尽力把屏幕锁定为竖屏；需要全屏 / 用户手势的浏览器会拒绝 → 静默忽略，
+// 布局本身自适应，横屏只是降级而不是崩溃
+function tryLockPortrait() {
+  try {
+    if (screen.orientation && screen.orientation.lock) {
+      screen.orientation.lock('portrait').catch(() => {});
+    }
+  } catch (err) { /* 忽略 */ }
 }
 
 /* ============================================================
@@ -155,23 +280,70 @@ function drawPlayers() {
   }
 }
 
-// 屏幕左上角 HUD：当前格子坐标
+// 屏幕左上角 HUD：当前格子坐标 + 倾斜传感器状态
 function drawHUD() {
   const me = gameState.players.me;
-  noStroke();
-  fill(0, 0, 0, 0.45);
-  rect(8, 8, 106, 28, 8);
-  fill(255);
+  const line1 = 'X ' + me.x + ' · Y ' + me.y;
+  const line2 = sensorStatusText();
+
   textSize(14);
   textAlign(LEFT, TOP);
-  text('X ' + me.x + ' · Y ' + me.y, 18, 14);
+  const w = Math.max(textWidth(line1), textWidth(line2)) + 20;
+
+  noStroke();
+  fill(0, 0, 0, 0.45);
+  rect(8, 8, w, 46, 8);
+  fill(255);
+  text(line1, 18, 14);
+  text(line2, 18, 30);
+}
+
+function sensorStatusText() {
+  if (sensors.denied) {
+    return '倾斜: 权限被拒 · 用按钮/滑动';
+  }
+  if (sensors.needPermission && !sensors.permissionAsked) {
+    return '倾斜: 点 CALIBRATE 授权';
+  }
+  if (sensors.calibrated) {
+    if (sensors.latest == null) return '倾斜: 已校准';
+    const d = sensors.latest - sensors.neutral;
+    const arrow = d > TILT_DEADZONE ? '→' : d < -TILT_DEADZONE ? '←' : '·';
+    return '倾斜: ' + arrow + ' ' + Math.round(d) + '°';
+  }
+  if (sensors.calibratePressed && !sensors.available) {
+    return '倾斜: 无传感器 · 用按钮/滑动';
+  }
+  return '倾斜: 点 CALIBRATE 校准';
 }
 
 /* ============================================================
- * 输入 —— 屏幕方向按钮（手机触摸）+ 键盘（桌面调试）
- * 将来接入多人同步时，按钮只负责发消息，不再直接调用 movePlayer
+ * 输入
  * ============================================================ */
-function bindInput() {
+
+// Swipe：在游戏画面上向上/向下滑动，每次移动一格
+function bindSwipe(canvasEl) {
+  let start = null;
+
+  canvasEl.addEventListener('pointerdown', (e) => {
+    if (start === null) start = { x: e.clientX, y: e.clientY };
+  });
+
+  const finish = (e) => {
+    if (start === null) return;
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    start = null;
+    if (Math.abs(dy) < SWIPE_DIST) return;      // 距离不够 → 忽略
+    if (Math.abs(dy) <= Math.abs(dx)) return;   // 横向为主 → 忽略（横向留给倾斜）
+    movePlayer('me', 0, dy < 0 ? -1 : 1);       // 上滑向上走一格，下滑向下走一格
+  };
+  canvasEl.addEventListener('pointerup', finish);
+  canvasEl.addEventListener('pointercancel', () => { start = null; });
+}
+
+// 备用方向按钮：每按一次移动一格
+function bindDpad() {
   const dirs = {
     'btn-up':    { dx: 0, dy: -1 },
     'btn-down':  { dx: 0, dy: 1 },
@@ -184,13 +356,15 @@ function bindInput() {
     if (!btn) continue;
     const dir = dirs[id];
     btn.addEventListener('pointerdown', (e) => {
-      e.preventDefault();                 // 阻止长按菜单 / 触摸模拟鼠标二次触发
-      movePlayer('me', dir.dx, dir.dy);   // 每按一次移动一格
+      e.preventDefault();
+      movePlayer('me', dir.dx, dir.dy);
     });
     btn.addEventListener('contextmenu', (e) => e.preventDefault());
   }
+}
 
-  // 桌面调试：方向键 / WASD
+// 桌面调试：方向键 / WASD
+function bindKeyboard() {
   window.addEventListener('keydown', (e) => {
     const keyMap = {
       'ArrowUp': { dx: 0, dy: -1 },  'w': { dx: 0, dy: -1 }, 'W': { dx: 0, dy: -1 },
@@ -206,6 +380,21 @@ function bindInput() {
   });
 }
 
+function bindInput() {
+  bindSwipe(document.querySelector('#canvas-container canvas'));
+  bindDpad();
+  bindKeyboard();
+
+  const calBtn = document.getElementById('btn-calibrate');
+  if (calBtn) calBtn.addEventListener('click', onCalibratePress);
+
+  window.addEventListener('deviceorientation', onDeviceOrientation);
+
+  // 阻止 Swipe / 触摸导致页面滚动与浏览器缩放
+  document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+  document.addEventListener('gesturestart', (e) => e.preventDefault());   // iOS 双指缩放
+}
+
 /* ============================================================
  * p5 生命周期
  * ============================================================ */
@@ -214,6 +403,8 @@ function setup() {
   const canvas = createCanvas(holder.clientWidth, holder.clientHeight);
   canvas.parent(holder);
   textFont('monospace');
+
+  sensors.needPermission = needsSensorPermission();
 
   // 摄像机初始就对正玩家，避免开局从 (0,0) 飞过来
   const me = gameState.players.me;
@@ -227,6 +418,7 @@ function setup() {
 function draw() {
   background('#181b26');   // 地图外区域的颜色
 
+  updateTilt();
   updateCamera();
 
   push();
@@ -239,6 +431,7 @@ function draw() {
   drawHUD();
 }
 
+// 手机旋转 / 窗口尺寸变化时重新适配画布
 function windowResized() {
   const holder = document.getElementById('canvas-container');
   resizeCanvas(holder.clientWidth, holder.clientHeight);
