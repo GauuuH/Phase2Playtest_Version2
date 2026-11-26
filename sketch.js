@@ -25,6 +25,21 @@
  *
  * 移动同步不需要 shareEmit / shared：me 的自动补丁已覆盖全部需求。
  *
+ * ── 占地（Territory）同步方案 —— 已核实 1.15.0 源码后选择 ──
+ * 可用 API 事实：
+ *   · shared 是房间级 Proxy：按路径写入补丁，worker 回显（echo）+
+ *     未确认写保护（_sharePending），保证所有设备收敛到 worker 的同一份值；
+ *   · welcome 消息携带完整 shared → 中途加入的玩家直接拿到完整地图；
+ *   · 断线重连时 hello 消息重发完整 shared/me；
+ *   · shareEmit / shareEvent 是一次性事件：不存储、不重放，
+ *     迟到加入的玩家收不到 → 不适合承载地图持久状态，故不使用。
+ * 方案：shared.cells["x,y"] = { o: 玩家ID, c: 颜色下标 }
+ *   · 每次移动只写实际进入的格子（顶墙不动不写）→ 站立不重复触发；
+ *   · 同一格同时占领：worker 按到达顺序 last-write-wins，
+ *     所有手机最终显示同一结果（一致性优先，平手由服务器裁决）；
+ *   · 主人 ID 与颜色同一条记录一起写，不存在字段撕裂。
+ * 未连接服务器时不做本地占地（加入后地图以服务器为准，避免各设备不一致）。
+ *
  * ── 操作方式（手机） ──
  *   · Swipe：画面上滑/下滑，每次移动一格
  *   · Tilt ：左右倾斜横向移动（死区 + 定间隔），CALIBRATE 校准中立角
@@ -126,12 +141,60 @@ function onlineCount() {
  * 移动逻辑 —— 唯一入口，与输入方式无关
  * 只写自己的 me；边界检查在这里做（0 ~ GRID-1）。
  * p5-phone 会把 me 的改动自动同步给其他手机。
+ * 每次移动只处理“实际进入”的格子：顶墙没动时不触发占地。
  * ============================================================ */
 function moveMe(dx, dy) {
   const nx = constrain(me.x + dx, 0, GRID - 1);
   const ny = constrain(me.y + dy, 0, GRID - 1);
+  if (nx === me.x && ny === me.y) return;   // 没动（顶墙）：不占地、不写状态
   me.x = nx;   // 已连接：自动同步；未连接：本地保存，连接时随 hello 补发
   me.y = ny;
+  captureCell(nx, ny);
+}
+
+/* ============================================================
+ * 占地 —— shared.cells["x,y"] = { o: 玩家ID, c: 颜色下标 }
+ * 规则：
+ *   · 空手玩家进入格子 → 格子归其所有（owner 初始为 null = 无此 key）
+ *   · 进入他人格子 → 所有权立即转移（同 key 覆盖，服务器裁决顺序）
+ *   · 携带 Object 的玩家不占地（carryingObject 为 Object 系统预留，
+ *     当前阶段所有玩家默认为空手 false）
+ * ============================================================ */
+function captureCell(x, y) {
+  if (me.carryingObject) return;   // 携带 Object 时不能占领（预留）
+
+  const key  = x + ',' + y;
+  const mine = isShareConfigured() ? String(window.shareClientId || '') : 'local';
+  if (!mine) return;               // 还没连上服务器：不写本地占地（以服务器地图为准）
+
+  const cells = window.shared.cells || (window.shared.cells = {});
+  const cur = cells[key];
+  if (cur && cur.o === mine) return;   // 已属于自己：不重复触发
+
+  // 写入共享状态 → p5-phone 自动同步给所有手机
+  cells[key] = {
+    o: mine,
+    c: (typeof me.color === 'number' && me.color >= 0) ? me.color : 0
+  };
+}
+
+function cellOwner(x, y) {
+  const cells = window.shared.cells;
+  if (!cells) return null;
+  return cells[x + ',' + y] || null;
+}
+
+// HUD 用：自己拥有的格子数量（仅本机显示，无全局排名）
+function myCellCount() {
+  const mine = isShareConfigured() ? String(window.shareClientId || '') : 'local';
+  if (!mine) return 0;
+  const cells = window.shared.cells || {};
+  let n = 0;
+  for (const key in cells) {
+    const c = cells[key];
+    if (c && c.o === mine) n++;
+  }
+  return n;
 }
 
 /* ============================================================
@@ -168,6 +231,7 @@ function ensureMyColor() {
     const s = SPAWNS[idx % SPAWNS.length];
     me.x = s.x;   // 新玩家放到自己的出生点；重连玩家保留原位置
     me.y = s.y;
+    captureCell(s.x, s.y);   // 出生格子自动归自己所有
   }
 }
 
@@ -302,7 +366,7 @@ function drawTiles() {
   noStroke();
   for (let y = 0; y < GRID; y++) {
     for (let x = 0; x < GRID; x++) {
-      fill((x + y) % 2 === 0 ? '#8fae6b' : '#84a362');
+      fill(cellFillColor(x, y));
       rect(x * CELL, y * CELL, CELL, CELL);
       drawLandmark(x, y);
     }
@@ -316,7 +380,7 @@ function drawTiles() {
   }
 }
 
-// 确定性“随机”地标（石头 / 树）
+// 确定性地标（石头 / 树）
 function drawLandmark(x, y) {
   const h = Math.floor(Math.abs(Math.sin(x * 127.1 + y * 311.7) * 43758.5453)) % 100;
   const cx = x * CELL + CELL / 2;
@@ -333,6 +397,22 @@ function drawLandmark(x, y) {
     fill(46, 88, 52);
     rect(cx - CELL * 0.05, cy + CELL * 0.08, CELL * 0.1, CELL * 0.2);
   }
+}
+
+// 格子颜色：中立 = 棋盘绿；被占领 = 主人的代表色（浅色调，网格线仍清晰）
+function cellFillColor(x, y) {
+  const cell = cellOwner(x, y);
+  if (!cell) {
+    return (x + y) % 2 === 0 ? [143, 174, 107] : [132, 163, 98];
+  }
+  const c = PALETTE[
+    (typeof cell.c === 'number' && cell.c >= 0) ? cell.c % PALETTE.length : 0
+  ];
+  return [
+    Math.round(c[0] * 0.55 + 255 * 0.45),
+    Math.round(c[1] * 0.55 + 255 * 0.45),
+    Math.round(c[2] * 0.55 + 255 * 0.45)
+  ];
 }
 
 function drawBorder() {
@@ -383,12 +463,13 @@ function drawOnePlayer(p, isSelf) {
   }
 }
 
-// HUD：坐标 + 倾斜状态 + 联机状态
+// HUD：坐标 + 倾斜状态 + 联机状态 + 自己占地数（开发测试用，无全局排名）
 function drawHUD() {
   const lines = [
     'X ' + me.x + ' · Y ' + me.y,
     sensorStatusText(),
-    connectionText()
+    connectionText(),
+    '占地 ' + myCellCount()
   ];
 
   textSize(14);
@@ -560,13 +641,18 @@ function setup() {
       host: SHARE_CONFIG.host,       // URL 参数 ?shareHost= 优先于这里
       room: SHARE_CONFIG.room,
       app: SHARE_CONFIG.app,
-      me: { x: 12, y: 12, color: -1 }   // color -1 = 未分配，连接后自动分配
+      shared: { cells: {} },        // 占地地图：cells["x,y"] = { o: 玩家ID, c: 颜色下标 }
+      me: {
+        x: 12, y: 12, color: -1,    // color -1 = 未分配，连接后自动分配
+        carryingObject: false       // 为 Object 系统预留：携带时不能占领
+      }
     });
     if (typeof showDesktopQr === 'function') showDesktopQr();  // 桌面二维码邀请（手机端自动不显示）
   } else {
-    // 单机模式：未配置服务器时仍可本地游玩（me 为普通对象）
-    window.me = { x: 12, y: 12, color: 0 };
+    // 单机模式：未配置服务器时仍可本地游玩（me / shared 为普通对象）
+    window.me = { x: 12, y: 12, color: 0, carryingObject: false };
     window.guests = window.guests || [];
+    window.shared.cells = {};
   }
 
   // 摄像机初始就对正玩家

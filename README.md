@@ -27,6 +27,14 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 - 新玩家自动分配颜色与出生点（最多 7 人）；加入/离开/断线重连由 p5-phone 自动处理
 - HUD 显示连接状态与在线人数
 
+### 占地（Territory）
+
+- 中立格子 owner 初始为 null；空手玩家进入格子即占领（owner = 玩家 ID，颜色 = 玩家颜色）；进入他人格子立即转移
+- 每次移动只处理实际进入的格子；出生格子自动归自己所有
+- 同步：`shared.cells["x,y"] = { o: 玩家ID, c: 颜色下标 }`，由 p5-phone 按路径补丁同步，所有设备收敛到服务器的同一份值；中途加入的玩家从 welcome 消息获得完整地图
+- `me.carryingObject`（默认 false）为 Object 系统预留：携带 Object 时不占领
+- HUD 显示自己拥有的格子数（开发测试用，无全局排名）
+
 ### 配置共享服务器（必需，一次性）
 
 p5-phone 的 Share 需要本项目自己部署的 Worker（免费 Cloudflare 账号）：
