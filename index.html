@@ -9,45 +9,126 @@
 
   <link rel="stylesheet" href="style.css" />
 
-  <!-- p5.js（CDN 多级回退：jsdelivr 在部分网络不可用） -->
+  <!--
+    依赖异步加载器：
+    · 每个 CDN 源最多等 7 秒（防止网络屏蔽时页面被同步 script 卡死）；
+    · 失败自动换下一个源（jsdelivr → unpkg → cdnjs）；
+    · 每一步在页面底部状态行显示可见进度；
+    · p5 必需；p5-phone 失败也继续（游戏降级为单机模式）；
+    · 全部依赖就绪后才加载 sketch.js（p5 全局模式兼容动态加载）。
+  -->
   <script>
-    window.__cdnFallbacks = {
-      'p5': [
-        'https://unpkg.com/p5@1.9.4/lib/p5.min.js',
-        'https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js'
-      ],
-      'p5-phone': [
-        'https://unpkg.com/p5-phone@1.15.0/dist/p5-phone.min.js'
-      ]
-    };
-    function __loadScript(lib, index) {
-      var list = window.__cdnFallbacks[lib];
-      if (index >= list.length) {
-        var st = document.getElementById('net-status');
-        if (st) st.textContent = '依赖库加载失败 (' + lib + ') · 请检查网络后刷新';
-        return;
+    (function () {
+      var CDN = {
+        'p5': [
+          'https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js',
+          'https://unpkg.com/p5@1.9.4/lib/p5.min.js',
+          'https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js'
+        ],
+        'p5-phone': [
+          'https://cdn.jsdelivr.net/npm/p5-phone@1.15.0/dist/p5-phone.min.js',
+          'https://unpkg.com/p5-phone@1.15.0/dist/p5-phone.min.js'
+        ]
+      };
+      var TIMEOUT = 7000;   // 单个 CDN 尝试超时（毫秒）
+
+      function status(text) {
+        var el = document.getElementById('net-status');
+        if (el) el.textContent = text;
       }
-      var s = document.createElement('script');
-      s.src = list[index];
-      s.onerror = function () { __loadScript(lib, index + 1); };
-      document.head.appendChild(s);
-    }
+
+      function loadScript(url) {
+        return new Promise(function (resolve, reject) {
+          var s = document.createElement('script');
+          var done = false;
+          var timer = setTimeout(function () {
+            if (done) return;
+            done = true;
+            s.onload = s.onerror = null;
+            try { s.remove(); } catch (e) {}
+            reject(new Error('超时: ' + url.replace('https://', '')));
+          }, TIMEOUT);
+          s.onload = function () {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            resolve();
+          };
+          s.onerror = function () {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            try { s.remove(); } catch (e) {}
+            reject(new Error('失败: ' + url.replace('https://', '')));
+          };
+          s.src = url;
+          document.head.appendChild(s);
+        });
+      }
+
+      function loadChain(name) {
+        var urls = CDN[name];
+        var i = 0;
+        function next() {
+          if (i >= urls.length) {
+            return Promise.reject(new Error(name + ' 所有 CDN 源均加载失败'));
+          }
+          var url = urls[i++];
+          status('加载依赖 ' + name + '… 第 ' + i + '/' + urls.length + ' 个源');
+          return loadScript(url).catch(next);
+        }
+        return next();
+      }
+
+      function loadSketch() {
+        status('初始化…');
+        var s = document.createElement('script');
+        s.onerror = function () {
+          status('初始化失败: sketch.js 加载失败 · 请刷新重试');
+        };
+        s.src = 'sketch.js?v=5';
+        document.head.appendChild(s);
+        // 兜底：若页面早已完成加载而 p5 全局实例尚未建立，手动补建一次
+        setTimeout(function () {
+          if (document.readyState === 'complete' &&
+              typeof p5 !== 'undefined' && !p5.instance &&
+              typeof window.setup === 'function') {
+            try { new p5(); } catch (e) {
+              status('初始化失败: ' + (e && e.message ? e.message : e));
+            }
+          }
+        }, 1500);
+        // 看门狗：10 秒后仍无画面 → 显示诊断信息
+        setTimeout(function () {
+          if (typeof p5 !== 'undefined' && window.frameCount === undefined) {
+            status('初始化超时 · 请刷新重试（持续出现请检查网络）');
+          }
+        }, 10000);
+      }
+
+      status('加载中…');
+      loadChain('p5')
+        .then(function () {
+          return loadChain('p5-phone').catch(function () {
+            status('警告: p5-phone 未加载 · 仅单机模式，联机不可用');
+          });
+        })
+        .then(loadSketch)
+        .catch(function (err) {
+          status('初始化失败: ' + (err && err.message ? err.message : err) + ' · 请检查网络后刷新');
+        });
+    })();
   </script>
-  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"
-          onerror="__loadScript('p5', 0)"></script>
-  <!-- p5-phone（老师的模板同款版本）：手势锁定 + Share 多人同步 -->
-  <script src="https://cdn.jsdelivr.net/npm/p5-phone@1.15.0/dist/p5-phone.min.js"
-          onerror="__loadScript('p5-phone', 0)"></script>
 </head>
 <body>
   <div id="game">
     <!-- p5 画布挂载点（只显示角色附近的地图区域） -->
     <div id="canvas-container"></div>
 
-    <!-- 联机状态行：JOIN 前/失败时在这里给出可见提示 -->
+    <!-- 初始化/联机状态行：加载进度、JOIN 反馈、错误信息都在这里可见 -->
     <div id="net-status">加载中…</div>
 
-    <!-- 操作区：联机 + 校准 + 备用方向按钮 -->
+    <!-- 操作区：联机 + 开始 + 校准 + 备用方向按钮 -->
     <div id="controls">
       <div id="control-top">
         <button id="btn-join" class="cal-btn" aria-label="加入共享房间">JOIN</button>
@@ -63,6 +144,6 @@
     </div>
   </div>
 
-  <script src="sketch.js"></script>
+  <!-- sketch.js 由上面的加载器在依赖就绪后加载，不在此处同步加载 -->
 </body>
 </html>

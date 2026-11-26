@@ -106,6 +106,18 @@
 
 'use strict';
 
+/* 手机端初始化防护：
+ * · 关闭 p5-phone 的全屏调试面板（出错时不遮挡游戏界面）
+ * · 任何未捕获的 JS 错误显示在底部状态行
+ */
+window.SHOW_DEBUG = false;
+window.addEventListener('error', (e) => {
+  try {
+    const el = document.getElementById('net-status');
+    if (el) el.textContent = 'JS 错误: ' + (e.message || '未知错误');
+  } catch (x) { /* 忽略 */ }
+});
+
 /* ---------------- 世界配置 ---------------- */
 const GRID   = 24;            // 24 × 24 格子地图
 const CELL   = 40;            // 每格像素
@@ -1277,14 +1289,22 @@ function bindJoin() {
   btn.addEventListener('click', () => {
     if (!isShareConfigured() || isConnected()) return;
     if (typeof shareConnect !== 'function') {
-      setNetStatus('联机: 依赖库加载失败 · 请刷新重试');
+      setNetStatus('联机: p5-phone 未加载 · 仅单机模式');
       return;
     }
     // 点击立即反馈：连接中…
     btn.disabled = true;
     btn.textContent = '连接中…';
     lastJoinBtnState = 'connecting';
-    shareConnect().catch(() => {});
+    shareConnect()
+      .then(() => {
+        // 成功/失败结果由 updateNetStatus() / updateJoinButton() 显示
+      })
+      .catch((err) => {
+        // 不吞错误：把具体原因显示在状态行
+        const msg = err && err.message ? err.message : String(err);
+        setNetStatus('联机: 连接失败 · ' + msg);
+      });
   });
 }
 
@@ -1309,75 +1329,115 @@ function bindInput() {
 
 /* ============================================================
  * p5 生命周期
+ * 说明：setup() 分 4 段，每段独立 try/catch——
+ *   1) 画布；2) 输入绑定（最先执行，绑定后 JOIN/CALIBRATE 永远有效）；
+ *   3) 手势锁定 + 联机初始化（任一失败都降级，不影响游戏运行）；
+ *   4) 摄像机。任何一段出错都会把具体原因显示在底部状态行。
  * ============================================================ */
-function setup() {
-  const holder = document.getElementById('canvas-container');
-  const canvas = createCanvas(holder.clientWidth, holder.clientHeight);
-  canvas.parent(holder);
-  textFont('monospace');
+function reportInitError(stage, err) {
+  const msg = err && err.message ? err.message : String(err);
+  if (typeof console !== 'undefined') console.error('[初始化异常]', stage, err);
+  setNetStatus('初始化异常 (' + stage + '): ' + msg);
+}
 
-  // p5-phone：锁定手机手势（embedded 模式只作用于画布）
-  if (typeof lockGestures === 'function') {
-    lockGestures({ mode: 'embedded', element: canvas.elt });
+function setup() {
+  // ── 1) 画布 ──
+  try {
+    const holder = document.getElementById('canvas-container');
+    const canvas = createCanvas(holder.clientWidth, holder.clientHeight);
+    canvas.parent(holder);
+    textFont('monospace');
+    window.__gameCanvas = canvas.elt;
+  } catch (err) {
+    setNetStatus('初始化失败: 画布创建出错 · ' + (err && err.message ? err.message : err));
+    return;
+  }
+
+  // ── 2) 输入绑定最先执行：此后 JOIN / CALIBRATE / START / 方向键始终有效 ──
+  try {
+    bindInput();
+  } catch (err) {
+    reportInitError('输入绑定', err);
+  }
+
+  // ── 3) 手势锁定（失败不影响游戏） ──
+  try {
+    if (typeof lockGestures === 'function') {
+      lockGestures({ mode: 'embedded', element: window.__gameCanvas });
+    }
+  } catch (err) {
+    reportInitError('手势锁定', err);
   }
 
   sensors.needPermission = needsSensorPermission();
 
-  // 多人共享状态初始化（p5-phone Share）
-  const shareLibReady = typeof shareSetup === 'function';
-  if (shareLibReady && isShareConfigured()) {
-    shareSetup({
-      host: SHARE_CONFIG.host,       // URL 参数 ?shareHost= 优先于这里
-      room: SHARE_CONFIG.room,
-      app: SHARE_CONFIG.app,
-      shared: {
-        cells: {},                  // 占地地图：cells["x,y"] = { o: 玩家ID, c: 颜色下标 }
-        objects: {                  // 4 个公共 Object（新房间的初始状态）
-          o1: { state: 'ground' },
-          o2: { state: 'ground' },
-          o3: { state: 'ground' },
-          o4: { state: 'ground' }
+  // ── 3.5) 联机初始化（失败降级为单机，不中断游戏） ──
+  try {
+    const shareLibReady = typeof shareSetup === 'function';
+    if (shareLibReady && isShareConfigured()) {
+      shareSetup({
+        host: SHARE_CONFIG.host,       // URL 参数 ?shareHost= 优先于这里
+        room: SHARE_CONFIG.room,
+        app: SHARE_CONFIG.app,
+        shared: {
+          cells: {},                  // 占地地图：cells["x,y"] = { o: 玩家ID, c: 颜色下标 }
+          objects: {                  // 4 个公共 Object（新房间的初始状态）
+            o1: { state: 'ground' },
+            o2: { state: 'ground' },
+            o3: { state: 'ground' },
+            o4: { state: 'ground' }
+          },
+          game: { phase: 'lobby', round: 0 }   // 赛制：lobby / running / ended
         },
-        game: { phase: 'lobby', round: 0 }   // 赛制：lobby / running / ended
-      },
-      me: {
-        x: 12, y: 12, color: -1,    // color -1 = 未分配，连接后自动分配
-        carryingObject: null,       // 携带的 Object ID（null = 空手）
-        delivered: 0                // 已交付数量（自己）
+        me: {
+          x: 12, y: 12, color: -1,    // color -1 = 未分配，连接后自动分配
+          carryingObject: null,       // 携带的 Object ID（null = 空手）
+          delivered: 0                // 已交付数量（自己）
+        }
+      });
+      if (typeof showDesktopQr === 'function') {
+        // 只要不是线上部署地址（file:// / localhost / 局域网 IP 开发时），
+        // 二维码都指向 PAGES_URL，手机扫码才能打开
+        const hosted = location.hostname === 'gauuuh.github.io';
+        showDesktopQr(hosted ? undefined : { url: PAGES_URL });
       }
-    });
-    if (typeof showDesktopQr === 'function') {
-      // 只要不是线上部署地址（file:// / localhost / 局域网 IP 开发时），
-      // 二维码都指向 PAGES_URL，手机扫码才能打开
-      const hosted = location.hostname === 'gauuuh.github.io';
-      showDesktopQr(hosted ? undefined : { url: PAGES_URL });
+    } else if (shareLibReady) {
+      // 未配置服务器：单机模式（me / shared 为普通对象）
+      window.me = {
+        x: 12, y: 12, color: 0,
+        baseX: 12, baseY: 12,
+        carryingObject: null,
+        delivered: 0
+      };
+      window.guests = window.guests || [];
+      window.shared.cells = {};
+      window.shared.objects = {};
+      window.shared.game = { phase: 'lobby', round: 0 };
+    } else {
+      // p5-phone 库未加载：降级为本地单机对象，避免崩溃
+      window.me = { x: 12, y: 12, color: 0, baseX: 12, baseY: 12, carryingObject: null, delivered: 0 };
+      window.guests = window.guests || [];
+      window.shared = { cells: {}, objects: {}, game: { phase: 'lobby', round: 0 } };
+      setNetStatus('联机: 依赖库加载失败 · 请检查网络后刷新');
     }
-  } else if (shareLibReady) {
-    // 未配置服务器：单机模式（me / shared 为普通对象）
-    window.me = {
-      x: 12, y: 12, color: 0,
-      baseX: 12, baseY: 12,
-      carryingObject: null,
-      delivered: 0
-    };
-    window.guests = window.guests || [];
-    window.shared.cells = {};
-    window.shared.objects = {};
-    window.shared.game = { phase: 'lobby', round: 0 };
-  } else {
-    // p5-phone 库未加载（CDN 全部失败）：降级为本地单机对象，避免崩溃
+  } catch (err) {
+    reportInitError('联机', err);
+    // 降级：本地单机状态，保证游戏能继续运行
     window.me = { x: 12, y: 12, color: 0, baseX: 12, baseY: 12, carryingObject: null, delivered: 0 };
     window.guests = window.guests || [];
     window.shared = { cells: {}, objects: {}, game: { phase: 'lobby', round: 0 } };
-    setNetStatus('联机: 依赖库加载失败 · 请检查网络后刷新');
   }
 
-  // 摄像机初始就对正玩家
-  const t = clampCam(camTarget(me).x, camTarget(me).y);
-  gameState.camera.x = t.x;
-  gameState.camera.y = t.y;
+  // ── 4) 摄像机 ──
+  try {
+    const t = clampCam(camTarget(me).x, camTarget(me).y);
+    gameState.camera.x = t.x;
+    gameState.camera.y = t.y;
+  } catch (err) {
+    reportInitError('摄像机', err);
+  }
 
-  bindInput();
+  setNetStatus(connectionText());
 }
 
 function draw() {
