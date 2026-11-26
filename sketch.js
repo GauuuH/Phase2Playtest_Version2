@@ -70,6 +70,14 @@
  *   原携带者会在 resolveObjectConflicts() 中自动放下。将来在输入层
  *   （双指手势）调用即可，无需改同步逻辑。本阶段不接线。
  *
+ * ── 抢夺（已实现）──
+ *   双指同时点击画布（<350ms）→ trySteal()：必须空手、目标携带者
+ *   曼哈顿距离 ≤ 1、目标 Object 仍为 carried，才写所有权转移；
+ *   1.5s 冷却；成功/失败/距离/冷却都有屏幕反馈。
+ *   并发（不冒充原子性）：worker 按到达顺序定出唯一 by，输家自动放下；
+ *   已交付的 Object 由交付者本会话守护（assertDelivered），
+ *   被迟到的抢夺宣告复活时重新写回 delivered。
+ *
  * ── 操作方式（手机） ──
  *   · Swipe：画面上滑/下滑，每次移动一格
  *   · Tilt ：左右倾斜横向移动（死区 + 定间隔），CALIBRATE 校准中立角
@@ -113,15 +121,17 @@ const PALETTE = [
   [117, 230, 218]    // 6 青
 ];
 
-/* 7 个出生点（下标 = 颜色编号，所有设备一致）；同时是各玩家的基地 */
+/* 7 个出生点（下标 = 颜色编号，所有设备一致）；同时是各玩家的基地。
+ * 全部在地图外围（不允许出生在中央），且到中央 Object 区最近一格的
+ * 曼哈顿距离都等于 11（8 个等距候选点中取 7 个），保证公平。 */
 const SPAWNS = [
-  { x: 12, y: 12 },  // 中央
-  { x: 2,  y: 2  },  // 左上
-  { x: 21, y: 2  },  // 右上
-  { x: 2,  y: 21 },  // 左下
-  { x: 21, y: 21 },  // 右下
-  { x: 12, y: 2  },  // 上中
-  { x: 12, y: 21 }   // 下中
+  { x: 0,  y: 9  },   // 左
+  { x: 23, y: 9  },   // 右
+  { x: 0,  y: 14 },   // 左
+  { x: 23, y: 14 },   // 右
+  { x: 9,  y: 0  },   // 上
+  { x: 14, y: 0  },   // 上
+  { x: 9,  y: 23 }    // 下
 ];
 
 /* 4 个公共 Object：唯一 ID + 固定初始位置（地图中央区域，避开出生点） */
@@ -300,6 +310,7 @@ function tryDeliver(x, y) {
   window.shared.objects[objId] = { state: 'delivered', by: myOwnerId() };
   me.carryingObject = null;                     // 清空 → 恢复占地能力
   me.delivered = (typeof me.delivered === 'number' ? me.delivered : 0) + 1;
+  steal.deliveredByMe.add(objId);               // 守护：防止被迟到的抢夺宣告复活
 }
 
 // 每帧调用：裁决回滚 —— 若我携带的 Object 的 by 已不是我（服务器判定别人
@@ -308,9 +319,148 @@ function resolveObjectConflicts() {
   if (!me.carryingObject) return;
   const st = window.shared.objects && window.shared.objects[me.carryingObject];
   if (!st) return;
-  if (st.state === 'delivered' || st.state === 'carried' && st.by !== myOwnerId()) {
-    me.carryingObject = null;   // 输了 / 已被交付 → 放下
+  if (st.state === 'delivered') {
+    me.carryingObject = null;   // 已被交付 → 放下
+    return;
   }
+  if (st.state === 'carried' && st.by !== myOwnerId()) {
+    const lost = me.carryingObject;
+    me.carryingObject = null;   // 被抢 / 抢拾输了 → 放下，恢复占地能力
+    setStealFeedback('失去 ' + lost + '!', FEEDBACK_FAIL);
+  }
+}
+
+/* ============================================================
+ * 抢夺（Steal）—— 双指同时点击游戏画面
+ * 规则：
+ *   · 只有与携带 Object 的玩家曼哈顿距离 ≤ 1 格才能抢；
+ *   · 抢夺者必须空手；不能抢自己；
+ *   · 成功 = 复用 claimObject()（Object 所有权转移）：
+ *     原携带者在 resolveObjectConflicts() 里自动放下并恢复占地；
+ *   · 1.5s 冷却（每次尝试都进入冷却，防止无限来回抢）；
+ *   · 双指点击不触发 Swipe（滑动手势在第二根手指落下时作废）、
+ *     不触发缩放（画布 touch-action: none + gesturestart 拦截）。
+ * 并发说明（不冒充原子性）：双方同时抢同一携带者时，worker 按到达顺序
+ * 定出唯一 by，输家自动放下（同抢拾的“宣告 + 回滚”机制）。
+ * ============================================================ */
+const STEAL_COOLDOWN = 1500;   // 抢夺冷却（ms）
+
+const FEEDBACK_OK   = [255, 209, 102];   // 金色：成功
+const FEEDBACK_FAIL = [255, 112, 102];   // 红色：失败
+const FEEDBACK_COOL = [185, 195, 215];   // 灰蓝：冷却
+
+const steal = {
+  cooldownUntil: 0,
+  feedback: null,                 // { text, color, until }
+  deliveredByMe: new Set()        // 我交付过的 Object（本会话，守护已交付状态）
+};
+
+// 双指点按状态：pointerId → 按下时间
+const twoFinger = { pointers: new Map(), fired: false };
+
+function setStealFeedback(text, color) {
+  steal.feedback = { text, color, until: millis() + 1300 };
+}
+
+// 最近的携带者（不含自己）
+function nearestCarrier() {
+  let best = null, bestD = Infinity;
+  const gs = window.guests || [];
+  for (const g of gs) {
+    if (!g.carryingObject) continue;
+    const d = Math.abs(g.x - me.x) + Math.abs(g.y - me.y);   // 曼哈顿距离
+    if (d < bestD) { bestD = d; best = g; }
+  }
+  return best ? { g: best, d: bestD } : null;
+}
+
+// 一次抢夺尝试（由双指点击触发）
+function trySteal() {
+  const now = millis();
+  if (now < steal.cooldownUntil) {
+    setStealFeedback('冷却中…', FEEDBACK_COOL);
+    return;
+  }
+  steal.cooldownUntil = now + STEAL_COOLDOWN;   // 每次尝试都进入冷却
+
+  if (!isConnected()) {
+    setStealFeedback('未连接房间', FEEDBACK_FAIL);
+    return;
+  }
+  if (me.carryingObject) {
+    setStealFeedback('必须空手才能抢夺', FEEDBACK_FAIL);
+    return;
+  }
+  const t = nearestCarrier();
+  if (!t) {
+    setStealFeedback('周围无人携带 Object', FEEDBACK_FAIL);
+    return;
+  }
+  if (t.d > 1) {
+    setStealFeedback('距离不足 · 需相邻 1 格', FEEDBACK_FAIL);
+    return;
+  }
+  const objId = t.g.carryingObject;
+  const st = window.shared.objects && window.shared.objects[objId];
+  if (!st || st.state !== 'carried') {
+    setStealFeedback('Object 已不在对方手上', FEEDBACK_FAIL);   // 已被交付/转移
+    return;
+  }
+  claimObject(objId);   // 所有权转移：原携带者会自动放下
+  setStealFeedback('抢到 ' + objId + '!', FEEDBACK_OK);
+}
+
+// 每帧调用：守护“已交付”状态 —— 若我交付过的 Object 被迟到的抢夺宣告
+// 复活成 carried，就重新写回 delivered（抢夺者会因此自动放下）。
+// 这是对“已交付 Object 不允许被复活”的最终一致性保障；我离线后此守护
+// 随之消失，属已知限制。
+function assertDelivered() {
+  if (steal.deliveredByMe.size === 0) return;
+  for (const objId of steal.deliveredByMe) {
+    const st = window.shared.objects && window.shared.objects[objId];
+    if (st && st.state === 'carried') {
+      window.shared.objects[objId] = { state: 'delivered', by: myOwnerId() };
+    }
+  }
+}
+
+// 抢夺/冷却/失败反馈浮层
+function drawStealFeedback() {
+  if (!steal.feedback) return;
+  if (millis() > steal.feedback.until) {
+    steal.feedback = null;
+    return;
+  }
+  const a = constrain((steal.feedback.until - millis()) / 300, 0, 1);
+  const w = 210, h = 36;
+  const cx = width / 2, cy = height * 0.32;
+  noStroke();
+  fill(0, 0, 0, 130 * a);
+  rect(cx - w / 2, cy - h / 2, w, h, 10);
+  fill(steal.feedback.color[0], steal.feedback.color[1], steal.feedback.color[2], 255 * a);
+  textSize(15);
+  textAlign(CENTER, CENTER);
+  text(steal.feedback.text, cx, cy);
+}
+
+// 双指同时点击画布（< 350ms 内两根手指都按下）→ 触发一次抢夺尝试
+function bindTwoFingerTap(canvasEl) {
+  canvasEl.addEventListener('pointerdown', (e) => {
+    twoFinger.pointers.set(e.pointerId, { t0: performance.now() });
+    if (twoFinger.pointers.size === 2 && !twoFinger.fired) {
+      const times = Array.from(twoFinger.pointers.values()).map((p) => p.t0);
+      if (Math.max(...times) - Math.min(...times) < 350) {
+        twoFinger.fired = true;   // 手势结束（全部抬起）前只触发一次
+        trySteal();
+      }
+    }
+  });
+  const release = (e) => {
+    twoFinger.pointers.delete(e.pointerId);
+    if (twoFinger.pointers.size === 0) twoFinger.fired = false;
+  };
+  canvasEl.addEventListener('pointerup', release);
+  canvasEl.addEventListener('pointercancel', release);
 }
 
 /* ============================================================
@@ -751,16 +901,21 @@ function updateJoinButton() {
  * 输入
  * ============================================================ */
 
-// Swipe：画面上滑/下滑，每次移动一格
+// Swipe：画面上滑/下滑，每次移动一格。
+// 第二根手指落下时整个滑动手势作废（双指点击交给抢夺逻辑，不产生移动）。
 function bindSwipe(canvasEl) {
   let start = null;
 
   canvasEl.addEventListener('pointerdown', (e) => {
-    if (start === null) start = { x: e.clientX, y: e.clientY };
+    if (start === null) {
+      start = { id: e.pointerId, x: e.clientX, y: e.clientY };
+    } else {
+      start = null;   // 双指 → 取消滑动
+    }
   });
 
   const finish = (e) => {
-    if (start === null) return;
+    if (!start || e.pointerId !== start.id) return;
     const dx = e.clientX - start.x;
     const dy = e.clientY - start.y;
     start = null;
@@ -823,7 +978,9 @@ function bindJoin() {
 }
 
 function bindInput() {
-  bindSwipe(document.querySelector('#canvas-container canvas'));
+  const canvasEl = document.querySelector('#canvas-container canvas');
+  bindSwipe(canvasEl);
+  bindTwoFingerTap(canvasEl);   // 双指点击 = 抢夺（不触发 Swipe/缩放）
   bindDpad();
   bindKeyboard();
   bindJoin();
@@ -903,7 +1060,8 @@ function draw() {
   updateTilt();
   healObjects();            // 补齐缺失的 Object 条目
   ensureMyColor();          // 连接后：分配颜色/出生点/基地、解决颜色冲突
-  resolveObjectConflicts(); // 裁决回滚：抢拾输家自动放下
+  resolveObjectConflicts(); // 裁决回滚：抢拾/被抢的输家自动放下
+  assertDelivered();        // 守护已交付的 Object 不被迟到宣告复活
   updateJoinButton();
   updateCamera();
 
@@ -918,6 +1076,7 @@ function draw() {
 
   drawBaseArrow();          // 屏幕边缘指向自己基地的箭头
   drawHUD();
+  drawStealFeedback();      // 抢夺成功/失败/冷却/距离提示
 }
 
 // 手机旋转 / 窗口尺寸变化时重新适配画布

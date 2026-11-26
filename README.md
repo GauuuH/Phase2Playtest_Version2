@@ -34,6 +34,7 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 - 同步：`shared.cells["x,y"] = { o: 玩家ID, c: 颜色下标 }`，由 p5-phone 按路径补丁同步，所有设备收敛到服务器的同一份值；中途加入的玩家从 welcome 消息获得完整地图
 - `me.carryingObject` 携带 Object 时不占领
 - HUD 显示自己拥有的格子数（开发测试用，无全局排名）
+- **出生点 = 基地全部在地图外围**，到中央 Object 区最近格子的曼哈顿距离相等（11 格），无人出生在中央
 
 ### Object（拾取 / 携带 / 交付）
 
@@ -42,8 +43,9 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 - 携带者头顶显示金色 Object 标记（所有玩家可见）；携带时移动不占地
 - 基地 = 出生点（`me.baseX/baseY`）；携带回到自己基地自动交付 → Object 标记 delivered（暂不刷新），`me.delivered` +1，恢复占地
 - 屏幕边缘显示指向自己基地的箭头（基地在屏幕内时不显示），携带时更醒目
-- **同时拾取同一 Object**：p5-phone 1.15.0 / 现有 Worker 没有 CAS 或服务端裁决 API；采用「宣告 + 回滚」——worker 按到达顺序定出唯一携带者，输家自动放下（最终一致，有亚秒级双携带过渡窗口，非严格互斥）。详见 `sketch.js` 头部注释
-- `claimObject(objId)` 即预留的双指抢夺转移入口（本阶段未接线）
+- **双指抢夺**：两根手指同时点击画面触发；目标携带者曼哈顿距离 ≤ 1、抢夺者空手才能抢；成功即转移所有权（原携带者自动放下并恢复占地）；1.5s 冷却；成功/失败/距离/冷却均有屏幕反馈；双指点击不触发 Swipe 或缩放
+- **同时拾取/抢夺**：p5-phone 1.15.0 / 现有 Worker 没有 CAS 或服务端裁决 API；采用「宣告 + 回滚」——worker 按到达顺序定出唯一携带者，输家自动放下（最终一致，有亚秒级双携带过渡窗口，非严格互斥）。已交付的 Object 由交付者守护，不被迟到的抢夺宣告复活。详见 `sketch.js` 头部注释
+- `claimObject(objId)` 即所有权转移入口（拾取与抢夺共用）
 
 ### 配置共享服务器（必需，一次性）
 
