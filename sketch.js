@@ -4,17 +4,29 @@
  * 24×24 格子地图 + Camera Follow（只跟随自己的角色）
  * 手机竖屏游戏，电脑仅用于开发调试
  *
- * ── 多人架构（p5-phone-share = p5-phone 1.15.0 的 Share 功能） ──
- * 没有“电脑 Host 大屏”：每部手机运行同一个页面，显示同一张共享地图，
- * 摄像机只跟随自己的角色。共享状态全部由 p5-phone 的同步服务器
- * （Cloudflare PartyServer Worker）作为唯一数据源：
+ * ── 多人架构（SharedRoom / MQTT，复用 DECIDER Phase2 旧项目方案） ──
+ * 没有“电脑 Host 大屏”：每部手机运行同一个页面，直接加入同一个共享
+ * 房间（公共 MQTT broker 上的 topic），摄像机只跟随自己的角色。
+ * 联机层在 js/net.js，完全复用旧项目（my-project-phase-2）实际运行过的
+ * SharedRoom 机制：
+ *   · 库与地址：js/vendor/mqtt.min.js（MQTT.js）→ wss://broker.emqx.io:8084/mqtt
+ *     → wss://broker.hivemq.com:8884/mqtt（顺序尝试，与旧项目一致）；
+ *   · 房间机制：所有设备订阅 topic "gridwalker/phase2/<ROOM>"，
+ *     ROOM 取 ?room= URL 参数 → localStorage → 默认 GRIDWALKER；
+ *   · 初始化：mqtt.connect(url, { clean:true, reconnectPeriod:3000,
+ *     connectTimeout:8000, clientId:随机 })，单个 broker 9 秒未连上换下一个。
  *
- *   me     —— 本机玩家的状态（x, y, color）。写入 me.x / me.y 时，
- *             p5-phone 会自动把它同步给房间里其他手机；断线期间改动
- *             保存在本地，重连时随 hello 消息补发（已核实 1.15.0 源码）。
- *   guests —— 其他在线玩家的 me 快照数组（每个带 id），由 p5-phone
- *             的 welcome / presence 消息自动维护，加入、离开、断线重连
- *             都不需要我们处理。
+ *   me     —— 本机玩家的状态（x, y, color, baseX/baseY, carryingObject,
+ *             delivered）。写入 me 时 net.js 自动以 pstate 消息广播给房间
+ *             里其他手机（同时兼任心跳，1.5 秒一条）；断线期间改动保存在
+ *             本地，重连时随 hello 消息补发。
+ *   guests —— 其他在线玩家的 me 快照数组（每个带 id），由 net.js 维护：
+ *             收到 pstate/hello 即加入或更新，4 秒没收到任何消息的玩家
+ *             自动移除（值取自旧项目 OFFLINE_AFTER_MS）。
+ *   shared —— 房间级状态（cells / objects / game），net.js 用 Proxy 监听
+ *             写入：每个写入带 (ts, id) 时间戳广播，所有设备按同一规则
+ *             （先比 ts 再比 id）收敛到同一份值，等价于旧 Worker 的
+ *             按到达顺序 last-write-wins。
  *
  * 关键约定（避免设备间互相覆盖）：
  *   · 每台手机只写自己的 me，绝不写别人的状态；
@@ -23,41 +35,33 @@
  *     出生点由颜色下标确定（所有设备用同一张表，结果一致）；
  *     若两人同时拿到同色，id 字典序大的那台让位重选，自动收敛。
  *
- * 移动同步不需要 shareEmit / shared：me 的自动补丁已覆盖全部需求。
- *
- * ── 占地（Territory）同步方案 —— 已核实 1.15.0 源码后选择 ──
- * 可用 API 事实：
- *   · shared 是房间级 Proxy：按路径写入补丁，worker 回显（echo）+
- *     未确认写保护（_sharePending），保证所有设备收敛到 worker 的同一份值；
- *   · welcome 消息携带完整 shared → 中途加入的玩家直接拿到完整地图；
- *   · 断线重连时 hello 消息重发完整 shared/me；
- *   · shareEmit / shareEvent 是一次性事件：不存储、不重放，
- *     迟到加入的玩家收不到 → 不适合承载地图持久状态，故不使用。
+ * ── 占地（Territory）同步 ──
  * 方案：shared.cells["x,y"] = { o: 玩家ID, c: 颜色下标 }
  *   · 每次移动只写实际进入的格子（顶墙不动不写）→ 站立不重复触发；
- *   · 同一格同时占领：worker 按到达顺序 last-write-wins，
- *     所有手机最终显示同一结果（一致性优先，平手由服务器裁决）；
- *   · 主人 ID 与颜色同一条记录一起写，不存在字段撕裂。
+ *   · 同一格同时占领：各设备按 (ts, id) 统一裁决，所有手机最终显示
+ *     同一结果（一致性优先，不冒充原子性）；
+ *   · 主人 ID 与颜色同一条记录一起写，不存在字段撕裂；
+ *   · 中途加入/重连：hello / room-ping 会触发其他设备回发完整
+ *     room-state（cells/objects/game 全量快照），立即拿到完整地图。
  * 未连接服务器时不做本地占地（加入后地图以服务器为准，避免各设备不一致）。
  *
- * ── Object（拾取/携带/交付）同步方案 —— 已核实 1.15.0 源码后选择 ──
+ * ── Object（拾取/携带/交付）同步 ──
  * 状态：shared.objects[objId] = { state: 'ground'|'carried'|'delivered', by: 携带者ID }
  *   · 拾取 = 写 { state:'carried', by:我的ID }；交付 = 写 { state:'delivered', by:我的ID }；
  *   · 每台手机只写自己参与的转移，绝不替别人改状态；
- *   · 自己携带什么放在 me.carryingObject（Object ID 或 null），随 me 自动同步。
+ *   · 自己携带什么放在 me.carryingObject（Object ID 或 null），随 me 广播。
  *
  * 【关于“同时拾取同一 Object 只有一人成功”（要求 10）的如实说明】
- *   p5-phone 1.15.0 / 现有 Worker 没有提供 CAS（原子比较交换）或专门的服务端
- *   裁决 API。它提供的保证是：同 key 的补丁由 worker 按到达顺序串行应用
- *   （last-write-wins），并且所有设备都会收敛到 worker 的同一份值。
+ *   MQTT 公共 broker 没有 CAS（原子比较交换）或专门的服务端裁决。它提供的
+ *   保证是：所有设备都会收到相同的消息，并按同一规则（写入时间戳 (ts, id)
+ *   较大者胜）收敛到同一份值——等价于旧 Worker 的按到达顺序 last-write-wins。
  *   因此本实现采用「宣告 + 回滚」：
  *     1. 双方都可能先写出 { carried, by:自己 } 并短暂以为自己成功；
- *     2. worker 按到达顺序定出唯一赢家（写入 shared.objects[objId].by）；
+ *     2. 各设备用 (ts, id) 定出唯一赢家（写入 shared.objects[objId].by）；
  *     3. 输家看到 by ≠ 自己 → 自动放下（resolveObjectConflicts，每帧检查）。
- *   结果：所有设备最终一致，只有一个携带者；但存在亚秒级的“双携带”过渡窗口
- *   （手机上前台传播 <1s）。这不是严格意义上的互斥锁，是“服务器定序 + 客户端
- *   回滚”的最终一致性方案——如实记录，不冒充原子操作。
- *   未来若需要严格互斥，需要 Worker 增加 CAS 语义（当前版本没有）。
+ *   结果：所有设备最终一致，只有一个携带者；但存在亚秒级的“双携带”过渡窗口。
+ *   这不是严格意义上的互斥锁，是“统一裁决规则 + 客户端回滚”的最终一致性方案
+ *   ——如实记录，不冒充原子操作。
  *
  * ── 基地与交付 ──
  *   每个玩家的基地 = 自己的出生点（me.baseX / me.baseY，加入时写入并随 me 同步）。
@@ -74,7 +78,7 @@
  *   双指同时点击画布（<350ms）→ trySteal()：必须空手、目标携带者
  *   曼哈顿距离 ≤ 1、目标 Object 仍为 carried，才写所有权转移；
  *   1.5s 冷却；成功/失败/距离/冷却都有屏幕反馈。
- *   并发（不冒充原子性）：worker 按到达顺序定出唯一 by，输家自动放下；
+ *   并发（不冒充原子性）：各设备按 (ts, id) 统一裁决出唯一 by，输家自动放下；
  *   已交付的 Object 由交付者本会话守护（assertDelivered），
  *   被迟到的抢夺宣告复活时重新写回 delivered。
  *
@@ -87,13 +91,13 @@
  *     120 秒（消除设备时钟差，各设备等长计时；开赛误差 ≈ 网络延迟）；
  *     迟到加入/重载时 startAt 已过去较久 → 改用 startAt 反推剩余时间；
  *   · 结束：任何设备倒计时归零都写 { ended }（多台同时写同一值，
- *     worker 收敛，先写先冻结）；所有操作在非 running 阶段被冻结；
+ *     各设备按 (ts, id) 统一裁决收敛，先写先冻结）；所有操作在非 running 阶段被冻结；
  *   · 计分（结束时从共享状态计算，所有设备结果一致）：
  *     最终领地每格 +1；交付 Object 每个 +30；结束时仍携带每个 +15；
  *     比赛中不显示任何人的总分/排名，结束后才显示完整地图与明细；
  *   · 并发冲突（同时 START / 同时结束 / 同时 PLAY AGAIN）：
  *     同 key 覆盖 + 局号去重（每台设备每个局号只重置/锁定一次），
- *     最终都收敛到 worker 的同一份 game 状态。
+ *     最终都收敛到同一份 game 状态。
  *
  * ── 操作方式（手机） ──
  *   · Swipe：画面上滑/下滑，每次移动一格
@@ -106,11 +110,7 @@
 
 'use strict';
 
-/* 手机端初始化防护：
- * · 关闭 p5-phone 的全屏调试面板（出错时不遮挡游戏界面）
- * · 任何未捕获的 JS 错误显示在底部状态行
- */
-window.SHOW_DEBUG = false;
+/* 手机端初始化防护：任何未捕获的 JS 错误显示在底部状态行 */
 window.addEventListener('error', (e) => {
   try {
     const el = document.getElementById('net-status');
@@ -119,10 +119,9 @@ window.addEventListener('error', (e) => {
 });
 
 /* ---------------- 诊断模式 (?debug=local 或 #debug=local) ----------------
- * 完全排除联机影响：不调用 shareSetup()/shareConnect()、不访问 Worker；
+ * 完全排除联机影响：不调用 netInit()/netConnect()、不访问 broker；
  * isShareConfigured() 返回 false → 所有逻辑自然走本地单机分支。
- * 状态行显示帧计数（证明 draw() 在跑），JOIN/CALIBRATE 点击给出明确反馈。
- * 注意：命名避开 p5-phone 的全局函数 debug()（否则会解析冲突）。 */
+ * 状态行显示帧计数（证明 draw() 在跑），JOIN/CALIBRATE 点击给出明确反馈。 */
 const debugState = {
   mode: false,
   message: ''
@@ -160,17 +159,12 @@ const SCORE_CELL = 1;        // 最终领地每格 1 分
 const SCORE_DELIVERED = 30;  // 交付一个 Object 30 分
 const SCORE_CARRIED = 15;    // 结束时仍携带一个 Object 15 分
 
-/* ---------------- 联机配置 ---------------- */
+/* ---------------- 联机配置（SharedRoom / MQTT，实现见 js/net.js） ---------------- */
 const SHARE_CONFIG = {
-  host: 'https://p5-phone-share.npuckett.workers.dev',  // 课堂共享服务器（p5-phone-share）
-  room: 'grid-walker',   // 房间名：同一房间的手机互相可见
-  app: 'phase2-playtest'
+  room: 'GRIDWALKER'   // 房间名：同一房间的手机互相可见（?room= URL 参数可覆盖）
 };
 
 const MAX_PLAYERS = 7;   // 架构预留：最多 7 名玩家（先支持 2 部手机测试）
-
-/* 页面部署地址：桌面二维码在本地打开（file://）时改指这里，手机才能打开 */
-const PAGES_URL = 'https://gauuuh.github.io/Phase2Playtest_Version2/';
 
 /* 7 种玩家颜色（下标 = 颜色编号，全部设备一致） */
 const PALETTE = [
@@ -205,7 +199,7 @@ const OBJECTS = [
 ];
 
 /* ---------------- 游戏状态（摄像机等本地状态） ---------------- */
-/* 玩家状态不在本地对象里：自己在 p5-phone 的 me 里，他人在 guests 里 */
+/* 玩家状态不在本地对象里：自己在 net.js 维护的 me 里，他人在 guests 里 */
 const gameState = {
   camera: { x: 0, y: 0 }   // 摄像机左上角的世界坐标（像素）
 };
@@ -239,9 +233,8 @@ const sensors = {
  * ============================================================ */
 function isShareConfigured() {
   if (debugState.mode) return false;   // 诊断模式：不联机、不访问服务器
-  if (SHARE_CONFIG.host && SHARE_CONFIG.host.trim()) return true;
-  try { return !!new URLSearchParams(location.search).get('shareHost'); }
-  catch (e) { return false; }
+  if (SHARE_CONFIG.room && SHARE_CONFIG.room.trim()) return true;
+  return false;
 }
 
 function isConnected() {
@@ -344,7 +337,7 @@ function updateGameFlow() {
     game.localRound = round;
   }
 
-  // 倒计时归零 → 写 ended（多台同时写同一值，worker 收敛，先写先冻结）
+  // 倒计时归零 → 写 ended（多台同时写同一值，(ts,id) 统一裁决，先写先冻结）
   const online = !isShareConfigured() || isConnected();
   if (phase === 'running' && online && remainingMs() <= 0) {
     window.shared.game.phase = 'ended';
@@ -443,7 +436,7 @@ function captureCell(x, y) {
   const cur = cells[key];
   if (cur && cur.o === mine) return;   // 已属于自己：不重复触发
 
-  // 写入共享状态 → p5-phone 自动同步给所有手机
+  // 写入共享状态 → net.js 自动广播给所有手机（(ts,id) 统一裁决）
   cells[key] = {
     o: mine,
     c: (typeof me.color === 'number' && me.color >= 0) ? me.color : 0
@@ -504,7 +497,7 @@ function tryPickup(x, y) {
 
 /* 拾取宣告（同时是未来双指抢夺的转移入口，本阶段不接线）：
  * 写入 { carried, by:我的ID }；若同时有人抢同一 Object，
- * worker 按到达顺序定出唯一 by，输家由 resolveObjectConflicts() 自动放下。 */
+ * 各设备按 (ts, id) 统一裁决出唯一 by，输家由 resolveObjectConflicts() 自动放下。 */
 function claimObject(objId) {
   const mine = myOwnerId();
   if (!mine) return;
@@ -559,7 +552,7 @@ function resolveObjectConflicts() {
  *   · 1.5s 冷却（每次尝试都进入冷却，防止无限来回抢）；
  *   · 双指点击不触发 Swipe（滑动手势在第二根手指落下时作废）、
  *     不触发缩放（画布 touch-action: none + gesturestart 拦截）。
- * 并发说明（不冒充原子性）：双方同时抢同一携带者时，worker 按到达顺序
+ * 并发说明（不冒充原子性）：双方同时抢同一携带者时，各设备按 (ts, id)
  * 定出唯一 by，输家自动放下（同抢拾的“宣告 + 回滚”机制）。
  * ============================================================ */
 const STEAL_COOLDOWN = 1500;   // 抢夺冷却（ms）
@@ -1051,7 +1044,7 @@ function colorOf(i) {
   return PALETTE[typeof i === 'number' && i >= 0 && i < PALETTE.length ? i : 0];
 }
 
-// 渲染自己（me）+ 所有在线玩家（guests，由 p5-phone 自动维护）
+// 渲染自己（me）+ 所有在线玩家（guests，由 net.js 自动维护）
 function drawPlayers() {
   drawOnePlayer({ x: me.x, y: me.y, color: colorOf(me.color), obj: me.carryingObject || null }, true);
 
@@ -1184,13 +1177,13 @@ function sensorStatusText() {
 
 function connectionText() {
   if (debugState.mode) return '联机: 诊断模式 · 不访问服务器';
-  if (!isShareConfigured()) return '联机: 未配置服务器';
-  if (typeof shareSetup !== 'function') return '联机: 依赖库加载失败 · 单机画面可用 · 联机请刷新重试';
+  if (!isShareConfigured()) return '联机: 未配置房间';
+  if (typeof netConnect !== 'function') return '联机: 联机库加载失败 · 单机画面可用 · 请刷新重试';
   const st = window.shareStatus;
-  if (st === 'connected') return '联机: 已连接 · 在线 ' + onlineCount() + '/' + MAX_PLAYERS;
-  if (st === 'connecting') return '联机: 连接中…';
-  if (st === 'error') return '联机: 连接失败 · 请检查网络/服务器';
-  if (st === 'unsupported') return '联机: 浏览器不支持';
+  if (st === 'connected') return '联机: Connected · 在线 ' + onlineCount() + '/' + MAX_PLAYERS;
+  if (st === 'connecting') return '联机: Connecting…';
+  if (st === 'error') return '联机: Connection Failed · ' + (window.shareError || '请检查网络/服务器');
+  if (st === 'unsupported') return '联机: Connection Failed · 浏览器不支持 WebSocket';
   return '联机: 点 JOIN 加入房间';
 }
 
@@ -1241,7 +1234,7 @@ function updateJoinButton() {
   let state;
   if (debugState.mode) state = 'debugjoin';
   else if (!isShareConfigured()) state = 'noconfig';
-  else if (typeof shareSetup !== 'function') state = 'nolib';
+  else if (typeof netConnect !== 'function') state = 'nolib';
   else if (isConnected()) state = 'joined';
   else if (window.shareStatus === 'connecting') state = 'connecting';
   else if (window.shareStatus === 'error') state = 'error';
@@ -1249,10 +1242,10 @@ function updateJoinButton() {
   if (state === lastJoinBtnState) return;
   lastJoinBtnState = state;
   if (state === 'debugjoin') { btn.disabled = false; btn.textContent = 'JOIN'; }
-  else if (state === 'noconfig') { btn.disabled = true; btn.textContent = '无服务器'; }
+  else if (state === 'noconfig') { btn.disabled = true; btn.textContent = '无房间'; }
   else if (state === 'nolib') { btn.disabled = true; btn.textContent = '库加载失败'; }
-  else if (state === 'joined') { btn.disabled = true; btn.textContent = '已连接 ✓'; }
-  else if (state === 'connecting') { btn.disabled = true; btn.textContent = '连接中…'; }
+  else if (state === 'joined') { btn.disabled = true; btn.textContent = 'Connected ✓'; }
+  else if (state === 'connecting') { btn.disabled = true; btn.textContent = 'Connecting…'; }
   else if (state === 'error') { btn.disabled = false; btn.textContent = '重试 JOIN'; }
   else { btn.disabled = false; btn.textContent = 'JOIN'; }
 }
@@ -1361,34 +1354,34 @@ function bindKeyboard() {
   });
 }
 
-// JOIN：加入共享房间（必须在用户手势里调用 shareConnect）
+// JOIN：加入共享房间（点击即调用 netConnect，net.js 负责 MQTT 连接与状态）
 function bindJoin() {
   const btn = document.getElementById('btn-join');
   if (!btn) return;
   btn.addEventListener('click', () => {
     if (debugState.mode) {
-      // 诊断模式：不调用 shareConnect、不访问 Worker，只验证按钮与事件
+      // 诊断模式：不调用 netConnect、不访问 broker，只验证按钮与事件
       setDebugMessage('JOIN 按钮正常');
       return;
     }
     if (!isShareConfigured() || isConnected()) return;
-    if (typeof shareConnect !== 'function') {
-      flashStatus('联机: p5-phone 未加载 · 仅单机模式');
+    if (typeof netConnect !== 'function') {
+      flashStatus('联机: 联机库未加载 · 仅单机模式');
       return;
     }
-    // 点击立即反馈：连接中…
+    // 点击立即反馈：Connecting…（Connected / Connection Failed 由 net.js 状态驱动显示）
     btn.disabled = true;
-    btn.textContent = '连接中…';
+    btn.textContent = 'Connecting…';
     lastJoinBtnState = 'connecting';
-    flashStatus('联机: 正在连接房间…');
-    shareConnect()
+    flashStatus('Connecting…');
+    netConnect()
       .then(() => {
-        // 成功/失败结果由 updateNetStatus() / updateJoinButton() 显示
+        flashStatus('Connected ✓ · 房间 ' + (window.shareRoom || ''), 3000);
       })
       .catch((err) => {
         // 不吞错误：把具体原因显示在状态行
         const msg = err && err.message ? err.message : String(err);
-        flashStatus('联机: 连接失败 · ' + msg, 4000);
+        flashStatus('Connection Failed · ' + msg, 5000);
       });
   });
 }
@@ -1414,14 +1407,14 @@ function bindInput() {
 
 /* ============================================================
  * p5 生命周期
- * 说明：setup() 分 6 段，每段独立 try/catch——
+ * 说明：setup() 分 5 段，每段独立 try/catch——
  *   1) 状态初始化：me / shared / guests 最先就绪（debug=local 用本地对象，
- *      联机模式调 shareSetup，失败自动降级为单机，绝不带着未初始化的状态跑游戏）；
+ *      联机模式调 netInit 建立 SharedRoom 状态，失败自动降级为单机，
+ *      绝不带着未初始化的状态跑游戏）；
  *   2) 画布（失败 = 致命错误，状态行持续显示具体原因）；
  *   3) 输入绑定（此后 JOIN/CALIBRATE/START/方向键始终有效）；
- *   4) 手势锁定（任一失败都降级，不影响游戏运行）；
- *   5) 摄像机；
- *   6) 初始化成功提示。任何一段出错都会把具体原因显示在底部状态行。
+ *   4) 摄像机；
+ *   5) 初始化成功提示。任何一段出错都会把具体原因显示在底部状态行。
  * 另：setup() 首行设置 window.__gameStarted，供 index.html 加载器
  * 判断“游戏已启动”，防止重复创建 p5 实例。
  * ============================================================ */
@@ -1434,7 +1427,7 @@ function reportInitError(stage, err) {
 /* 致命初始化错误（如画布创建失败）：状态行优先显示，不被常规连接状态覆盖 */
 let fatalInitError = null;
 
-/* 本地单机状态：debug=local / 联机库缺失 / shareSetup 失败时使用。
+/* 本地单机状态：debug=local / 联机库缺失 / netInit 失败时使用。
  * 必须在任何 draw() / 按钮回调访问 me / shared / guests 之前完成，
  * 保证不联机也能正常显示单机游戏画面。 */
 function initLocalState() {
@@ -1459,7 +1452,7 @@ function setup() {
   // ── 1) 游戏状态初始化：必须最先完成，任何按钮回调 / 首帧 draw() 之前
   //      me / shared / guests 都已就绪（debug=local 同样先建好再运行游戏） ──
   if (debugState.mode) {
-    // 诊断模式：不调用 shareSetup()、不访问 Worker，直接使用本地单机状态
+    // 诊断模式：不调用 netInit()、不访问 broker，直接使用本地单机状态
     try {
       initLocalState();
       setNetStatus('诊断模式 · 本地状态就绪 · 不访问服务器');
@@ -1469,12 +1462,10 @@ function setup() {
     }
   } else {
     try {
-      const shareLibReady = typeof shareSetup === 'function';
-      if (shareLibReady && isShareConfigured()) {
-        shareSetup({
-          host: SHARE_CONFIG.host,       // URL 参数 ?shareHost= 优先于这里
-          room: SHARE_CONFIG.room,
-          app: SHARE_CONFIG.app,
+      const netLibReady = typeof netInit === 'function';
+      if (netLibReady && isShareConfigured()) {
+        netInit({
+          room: SHARE_CONFIG.room,      // ?room= URL 参数优先于这里（见 net.js）
           shared: {
             cells: {},                  // 占地地图：cells["x,y"] = { o: 玩家ID, c: 颜色下标 }
             objects: {                  // 4 个公共 Object（新房间的初始状态）
@@ -1491,22 +1482,16 @@ function setup() {
             delivered: 0                // 已交付数量（自己）
           }
         });
-        // 防御：库已加载但未按预期创建全局状态 → 降级为单机，保证画面正常显示
+        // 防御：联机层已加载但未按预期创建全局状态 → 降级为单机，保证画面正常显示
         if (!window.me || !window.shared) {
-          throw new Error('p5-phone 未创建 me/shared');
+          throw new Error('联机层未创建 me/shared');
         }
         if (!Array.isArray(window.guests)) window.guests = [];
-        if (typeof showDesktopQr === 'function') {
-          // 只要不是线上部署地址（file:// / localhost / 局域网 IP 开发时），
-          // 二维码都指向 PAGES_URL，手机扫码才能打开
-          const hosted = location.hostname === 'gauuuh.github.io';
-          showDesktopQr(hosted ? undefined : { url: PAGES_URL });
-        }
       } else {
-        // 未配置服务器或联机库缺失：单机模式（me / shared / guests 为普通对象）
+        // 未配置房间或联机库缺失：单机模式（me / shared / guests 为普通对象）
         initLocalState();
-        if (!shareLibReady) {
-          setNetStatus('联机: 依赖库加载失败 · 单机画面可用 · 联机请刷新重试');
+        if (!netLibReady) {
+          setNetStatus('联机: 联机库加载失败 · 单机画面可用 · 联机请刷新重试');
         }
       }
     } catch (err) {
@@ -1536,18 +1521,9 @@ function setup() {
     reportInitError('输入绑定', err);
   }
 
-  // ── 4) 手势锁定（失败不影响游戏） ──
-  try {
-    if (typeof lockGestures === 'function') {
-      lockGestures({ mode: 'embedded', element: window.__gameCanvas });
-    }
-  } catch (err) {
-    reportInitError('手势锁定', err);
-  }
-
   sensors.needPermission = needsSensorPermission();
 
-  // ── 5) 摄像机 ──
+  // ── 4) 摄像机 ──
   try {
     const t = clampCam(camTarget(me).x, camTarget(me).y);
     gameState.camera.x = t.x;
@@ -1556,7 +1532,7 @@ function setup() {
     reportInitError('摄像机', err);
   }
 
-  // ── 6) 初始化完成：显示明确的成功信息（瞬时提示后回到常规状态文本） ──
+  // ── 5) 初始化完成：显示明确的成功信息（瞬时提示后回到常规状态文本） ──
   if (debugState.mode) {
     debugState.message = '初始化完成 · 不访问服务器';
   } else {

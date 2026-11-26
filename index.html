@@ -10,11 +10,12 @@
   <link rel="stylesheet" href="style.css" />
 
   <!--
-    依赖异步加载器（顺序：p5 → p5-phone → sketch.js）：
+    依赖异步加载器（顺序：p5 → SharedRoom 联机库（mqtt.min.js + net.js）→ sketch.js）：
     · 每个 CDN 源最多等 7 秒（防止网络屏蔽时页面被同步 script 卡死）；
     · 失败自动换下一个源（jsdelivr → unpkg → cdnjs）；
     · 每一步在页面底部状态行显示可见进度（加载阶段 / 成功 / 错误）；
-    · p5 必需；p5-phone 失败也继续（游戏降级为单机模式）；
+    · p5 必需；mqtt.min.js / net.js 是本地文件（SharedRoom 联机层，
+      复用 DECIDER Phase2 旧项目的 MQTT 房间方案），失败也继续（游戏降级为单机模式）；
     · p5 与 sketch.js 全部就绪后，setup() 必定执行且只执行一次：
       优先使用 p5 自身的 load 事件自动初始化（它自带 p5.instance 防重复判断），
       仅当 load 已过去、自动初始化未生效时才手动 new p5()，并用
@@ -30,10 +31,6 @@
           'https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js',
           'https://unpkg.com/p5@1.9.4/lib/p5.min.js',
           'https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js'
-        ],
-        'p5-phone': [
-          'https://cdn.jsdelivr.net/npm/p5-phone@1.15.0/dist/p5-phone.min.js',
-          'https://unpkg.com/p5-phone@1.15.0/dist/p5-phone.min.js'
         ]
       };
       var TIMEOUT = 7000;   // 单个 CDN 尝试超时（毫秒）
@@ -159,23 +156,36 @@
           p5Ready = true;
           status('p5.js 加载成功 ✓', 'ok');
           // 诊断模式（?debug=local / #debug=local / sessionStorage debug=local）：
-          // 跳过 p5-phone，彻底排除联机库与 CDN 的影响
+          // 跳过 SharedRoom 联机层，彻底排除联机与网络的影响
           var isDebug = false;
           try { isDebug = sessionStorage.getItem('debug') === 'local'; } catch (e) {}
           if (!isDebug) isDebug = /[?&]debug=local/.test(location.search) || /debug=local/.test(location.hash);
           if (isDebug) {
-            status('诊断模式: 跳过 p5-phone · 不访问服务器', 'warn');
+            status('诊断模式: 跳过联机库 · 不访问服务器', 'warn');
             return Promise.resolve();
           }
-          return loadChain('p5-phone').then(function () {
-            status('p5-phone 加载成功 ✓', 'ok');
-          }).catch(function () {
-            status('警告: p5-phone 未加载 · 将使用单机模式', 'warn');
-          });
+          // SharedRoom 联机层（本地文件，复用 DECIDER Phase2 的 MQTT 房间方案）
+          return loadScript('js/vendor/mqtt.min.js?v=1')
+            .then(function () {
+              if (typeof mqtt === 'undefined' || typeof mqtt.connect !== 'function') {
+                throw new Error('mqtt.min.js 未导出 mqtt 全局变量');
+              }
+              status('联机库 mqtt.min.js 加载成功 ✓', 'ok');
+              return loadScript('js/net.js?v=1');
+            })
+            .then(function () {
+              if (typeof netConnect !== 'function' || typeof netInit !== 'function') {
+                throw new Error('net.js 未定义 netInit()/netConnect()');
+              }
+              status('联机层 net.js 加载成功 ✓', 'ok');
+            })
+            .catch(function (err) {
+              status('警告: 联机库未加载（' + (err && err.message ? err.message : err) + '）· 将使用单机模式', 'warn');
+            });
         })
         .then(function () {
           status('正在加载 sketch.js…');
-          return loadScript('sketch.js?v=6');
+          return loadScript('sketch.js?v=7');
         })
         .then(function () {
           sketchReady = true;

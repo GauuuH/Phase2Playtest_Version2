@@ -6,9 +6,9 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 
 原型阶段：验证地图、摄像机、手机操作与多人同步。
 
-- `index.html` / `style.css` / `sketch.js`（HTML + CSS + JavaScript + p5.js + p5-phone，无其他框架）
+- `index.html` / `style.css` / `sketch.js` / `js/net.js` / `js/vendor/mqtt.min.js`（HTML + CSS + JavaScript + p5.js + MQTT.js，无其他框架）
 - 24×24 二维格子地图，Camera Follow 只跟随自己的角色，边缘正确钳制
-- 手机竖屏适配（`100dvh`、安全区、`lockGestures` 手势锁定）
+- 手机竖屏适配（`100dvh`、安全区、触摸手势处理）
 
 ### 操作方式
 
@@ -20,18 +20,20 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 | JOIN | 加入共享房间（多人同步） |
 | 键盘（桌面调试） | WASD / 方向键 |
 
-### 多人同步（p5-phone-share = p5-phone 的 Share 功能）
+### 多人同步（SharedRoom / MQTT，复用 DECIDER Phase2 旧项目方案）
 
-- **没有电脑 Host**：每部手机显示同一张共享地图，摄像机只跟随自己；共享状态以同步服务器（Cloudflare PartyServer Worker）为唯一数据源
-- 每台手机只写自己的 `me`（x/y/color），p5-phone 自动同步；其他玩家从 `guests` 读取渲染
-- 新玩家自动分配颜色与出生点（最多 7 人）；加入/离开/断线重连由 p5-phone 自动处理
+- **没有电脑 Host**：每部手机直接加入同一个共享房间（公共 MQTT broker 上的 topic），摄像机只跟随自己；联机层为 `js/net.js` + `js/vendor/mqtt.min.js`
+- 连接地址（顺序尝试）：`wss://broker.emqx.io:8084/mqtt` → `wss://broker.hivemq.com:8884/mqtt`；房间 = topic `gridwalker/phase2/<ROOM>`（`?room=` URL 参数可覆盖，默认 `GRIDWALKER`）
+- 每台手机只写自己的 `me`（x/y/color/携带/交付），`net.js` 以 pstate 消息广播（兼 1.5 秒心跳）；其他玩家从 `guests` 读取渲染；4 秒无消息自动移除
+- JOIN 反馈：Connecting… / Connected ✓ / Connection Failed（附具体原因）
+- 新玩家自动分配颜色与出生点（最多 7 人）；加入/离开/断线重连由 `net.js` 处理（hello / bye / 心跳超时 / mqtt 自动重连）
 - HUD 显示连接状态与在线人数
 
 ### 占地（Territory）
 
 - 中立格子 owner 初始为 null；空手玩家进入格子即占领（owner = 玩家 ID，颜色 = 玩家颜色）；进入他人格子立即转移
 - 每次移动只处理实际进入的格子；出生格子自动归自己所有
-- 同步：`shared.cells["x,y"] = { o: 玩家ID, c: 颜色下标 }`，由 p5-phone 按路径补丁同步，所有设备收敛到服务器的同一份值；中途加入的玩家从 welcome 消息获得完整地图
+- 同步：`shared.cells["x,y"] = { o: 玩家ID, c: 颜色下标 }`，由 `net.js` 广播 cell 消息（带 (ts,id) 时间戳），所有设备按统一规则收敛到同一份值；中途加入的玩家通过 hello/room-ping 获得完整 room-state 快照
 - `me.carryingObject` 携带 Object 时不占领
 - HUD 显示自己拥有的格子数（开发测试用，无全局排名）
 - **出生点 = 基地全部在地图外围**，到中央 Object 区最近格子的曼哈顿距离相等（11 格），无人出生在中央
@@ -44,7 +46,7 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 - 基地 = 出生点（`me.baseX/baseY`）；携带回到自己基地自动交付 → Object 标记 delivered（暂不刷新），`me.delivered` +1，恢复占地
 - 屏幕边缘显示指向自己基地的箭头（基地在屏幕内时不显示），携带时更醒目
 - **双指抢夺**：两根手指同时点击画面触发；目标携带者曼哈顿距离 ≤ 1、抢夺者空手才能抢；成功即转移所有权（原携带者自动放下并恢复占地）；1.5s 冷却；成功/失败/距离/冷却均有屏幕反馈；双指点击不触发 Swipe 或缩放
-- **同时拾取/抢夺**：p5-phone 1.15.0 / 现有 Worker 没有 CAS 或服务端裁决 API；采用「宣告 + 回滚」——worker 按到达顺序定出唯一携带者，输家自动放下（最终一致，有亚秒级双携带过渡窗口，非严格互斥）。已交付的 Object 由交付者守护，不被迟到的抢夺宣告复活。详见 `sketch.js` 头部注释
+- **同时拾取/抢夺**：MQTT 公共 broker 没有 CAS 或服务端裁决 API；采用「宣告 + 回滚」——各设备按 (ts,id) 统一裁决出唯一携带者，输家自动放下（最终一致，有亚秒级双携带过渡窗口，非严格互斥）。已交付的 Object 由交付者守护，不被迟到的抢夺宣告复活。详见 `sketch.js` 头部注释
 - `claimObject(objId)` 即所有权转移入口（拾取与抢夺共用）
 
 ### 赛制（倒计时 / 计分 / 排名）
@@ -53,25 +55,23 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 - 每局 120 秒：倒计时由共享状态驱动（`shared.game = { phase, round, startAt }`），各设备在收到 running 时以本地时刻锁定起点、等长计时；任一台倒计时归零写 ended，所有设备同时冻结
 - 结束后：完整领地小地图 + 排名 + 得分明细（领地每格 +1，交付 Object 每个 +30，结束时仍携带每个 +15）；比赛中不显示任何人的总分/排名
 - **PLAY AGAIN**：清空地图与物品、所有玩家回基地并清空携带/交付数，回到大厅
-- 同时 START / 结束 / PLAY AGAIN：同 key 覆盖 + 局号去重（每局每台只重置/锁定一次），收敛到服务器同一份状态
+- 同时 START / 结束 / PLAY AGAIN：同 key 覆盖 + 局号去重（每局每台只重置/锁定一次），收敛到同一份状态
 
-### 配置共享服务器（必需，一次性）
+### 联机（SharedRoom，无需自建服务器）
 
-p5-phone 的 Share 需要本项目自己部署的 Worker（免费 Cloudflare 账号）：
+联机走公共 MQTT broker（WebSocket），不需要部署任何服务器：
 
-1. 克隆 [p5-phone 仓库](https://github.com/npuckett/p5-phone)，`cd companion/P5PhoneShare && npm install`
-2. `npx wrangler login`，然后 `npx wrangler deploy`，记下输出的 `https://xxx.workers.dev`
-3. 把 URL 填到 `sketch.js` 顶部的 `SHARE_CONFIG.host`（或者不改代码，用 `?shareHost=…&room=…` 链接打开页面）
-4. 老师如果提供了班级共用的 Worker URL，直接填即可
+- `wss://broker.emqx.io:8084/mqtt`（首选）→ `wss://broker.hivemq.com:8884/mqtt`（备用）
+- 库与房间机制复用 DECIDER Phase 2 旧项目（my-project-phase-2，自提交 a734abe 起实际使用）
+- 公共 broker 无鉴权：知道房间名的人都能读写房间消息（原型阶段可接受）
 
 ### 用两部手机测试
 
 1. 仓库 Settings → Pages → Source 选 **GitHub Actions**（推送后自动发布，约 1 分钟）
 2. 两部手机打开 `https://gauuuh.github.io/Phase2Playtest_Version2/`（HTTPS 是传感器与 WebSocket 的前提）
-3. 两台都点 **JOIN** → 进入同一房间（同 URL 即同房间）
-4. HUD 显示"已连接 · 在线 2/7"；任一台移动（滑动/倾斜/按钮），另一台立即看到
-5. 桌面打开同一页面会显示邀请二维码，手机扫码即可加入同一房间
+3. 两台都点 **JOIN** → 进入同一房间（同 URL 即同房间，默认 `GRIDWALKER`；测试隔离可用 `?room=XXXX`）
+4. HUD 显示"Connected · 在线 2/7"；任一台移动（滑动/倾斜/按钮），另一台立即看到
 
 ### 运行（本地）
 
-直接用浏览器打开 `index.html`（未配置服务器时为单机模式，可玩但无联机）。
+直接用浏览器打开 `index.html`（`?debug=local` 为纯单机诊断模式；联机与传感器建议用 HTTPS 页面）。
