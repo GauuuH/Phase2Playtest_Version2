@@ -53,8 +53,7 @@ const _NET = {
   DEFAULT_ROOM: 'GRIDWALKER',
   HEARTBEAT_MS: 1500,        // 心跳间隔（旧项目实际值）
   OFFLINE_AFTER_MS: 4000,    // 离线判定（旧项目实际值）
-  BROKER_SWITCH_MS: 9000,    // 单个 broker 未响应多久后换下一个（旧项目实际值）
-  ROOM_STATE_MS: 10000       // 周期性广播房间快照，帮助迟到设备收敛
+  BROKER_SWITCH_MS: 9000     // 单个 broker 未响应多久后换下一个（旧项目实际值）
 };
 
 let _client = null;          // mqtt 客户端
@@ -63,7 +62,6 @@ let _topic = '';             // 房间 topic
 let _myId = '';              // 本机玩家 id
 let _closedByUser = false;
 let _heartbeatTimer = null;
-let _roomStateTimer = null;
 let _pruneTimer = null;
 let _lastBrokerError = '';
 let _applyingRemote = false; // 应用远端消息时不回发
@@ -136,7 +134,8 @@ function _meSnapshot() {
     baseX: _meBacking.baseX,
     baseY: _meBacking.baseY,
     carryingObject: _meBacking.carryingObject,
-    delivered: _meBacking.delivered
+    delivered: _meBacking.delivered,
+    ready: !!_meBacking.ready
   };
 }
 
@@ -164,6 +163,7 @@ function _upsertGuest(s) {
   g.baseY = s.baseY;
   g.carryingObject = s.carryingObject;
   g.delivered = s.delivered;
+  g.ready = !!s.ready;
   g.lastSeen = Date.now();
 }
 
@@ -176,9 +176,24 @@ function _removeGuest(id) {
 
 function _pruneGuests() {
   const gs = window.guests || [];
+  const gone = window.guestsOffline || (window.guestsOffline = []);
   const now = Date.now();
   for (let i = gs.length - 1; i >= 0; i--) {
-    if (now - (gs[i].lastSeen || 0) > _NET.OFFLINE_AFTER_MS) gs.splice(i, 1);
+    if (now - (gs[i].lastSeen || 0) > _NET.OFFLINE_AFTER_MS) {
+      const g = gs.splice(i, 1)[0];
+      // 保留快照：比赛中途断线的参与者仍可参与最终计分
+      let dup = null;
+      for (let j = 0; j < gone.length; j++) {
+        if (String(gone[j].id) === String(g.id)) { dup = j; break; }
+      }
+      if (dup === null) {
+        gone.push({
+          id: g.id, x: g.x, y: g.y, color: g.color,
+          baseX: g.baseX, baseY: g.baseY,
+          carryingObject: g.carryingObject, delivered: g.delivered, ready: g.ready
+        });
+      }
+    }
   }
 }
 
@@ -186,7 +201,14 @@ function _pruneGuests() {
 
 function _snapshotGame() {
   const g = _sharedBacking.game;
-  return { phase: g.phase, round: g.round, startAt: g.startAt };
+  return {
+    phase: g.phase,
+    round: g.round,
+    startAt: g.startAt,
+    readyAt: g.readyAt,
+    participants: g.participants,
+    objects: g.objects
+  };
 }
 
 /* 本地写 cells[key]（cells Proxy 的 set 陷阱调用） */
@@ -398,6 +420,7 @@ function netInit(opts) {
   window.shareError = '';
   window.shareConnected = false;
   window.guests = [];
+  window.guestsOffline = [];
 
   const sharedInit = opts.shared || {};
   const meInit = opts.me || {};
@@ -406,7 +429,8 @@ function netInit(opts) {
     x: 12, y: 12, color: -1,
     baseX: undefined, baseY: undefined,
     carryingObject: null,
-    delivered: 0
+    delivered: 0,
+    ready: false
   };
   Object.assign(_meBacking, meInit);
 
@@ -597,16 +621,10 @@ function _startTimers() {
   if (!_heartbeatTimer) {
     _heartbeatTimer = setInterval(_publishMe, _NET.HEARTBEAT_MS);
   }
-  if (!_roomStateTimer) {
-    _roomStateTimer = setInterval(function () {
-      _send(_roomStateMsg());
-    }, _NET.ROOM_STATE_MS);
-  }
 }
 
 function _stopTimers() {
   if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
-  if (_roomStateTimer) { clearInterval(_roomStateTimer); _roomStateTimer = null; }
 }
 
 /* 离开页面：向房间广播 bye（尽力而为） */

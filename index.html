@@ -185,7 +185,7 @@
         })
         .then(function () {
           status('Loading sketch.js…');
-          return loadScript('sketch.js?v=8');
+          return loadScript('sketch.js?v=9');
         })
         .then(function () {
           sketchReady = true;
@@ -206,12 +206,11 @@
     <!-- 状态行：加载进度、JOIN 反馈、错误信息都在这里可见 -->
     <div id="net-status">Loading…</div>
 
-    <!-- 操作区：JOIN + START + CALIBRATE（方向键只在桌面键盘上，手机用滑动/倾斜/双指） -->
+    <!-- 操作区：JOIN + READY（手机用滑动/倾斜/双指操作，无需方向按钮与校准按钮） -->
     <div id="controls">
       <div id="control-top">
         <button id="btn-join" class="cal-btn" aria-label="Join shared room">JOIN</button>
-        <button id="btn-start" class="cal-btn" aria-label="Start game">START</button>
-        <button id="btn-calibrate" class="cal-btn" aria-label="Calibrate tilt sensor">CALIBRATE</button>
+        <button id="btn-ready" class="cal-btn" aria-label="Toggle ready">READY</button>
       </div>
     </div>
   </div>

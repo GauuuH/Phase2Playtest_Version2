@@ -15,9 +15,9 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 | 操作 | 说明 |
 |---|---|
 | Swipe | 画面上滑/下滑，每次移动一格 |
-| Tilt | 左右倾斜横向移动（5° 死区 + 220ms 定间隔），CALIBRATE 以当前姿态校准中立角 |
+| Tilt | 左右倾斜横向移动（5° 死区 + 180ms 定间隔）；无需校准——首次读数自动作为中立角；iOS 在点击 JOIN/READY 时自动请求授权 |
 | Two-Finger Tap | 双指同时点击画面：抢夺相邻玩家携带的 Object（1.5s 冷却） |
-| JOIN | 加入共享房间（多人同步） |
+| JOIN / READY | 加入共享房间 / 切换准备状态；全员就绪自动 3 秒倒计时开赛 |
 | 键盘（桌面调试） | WASD / 方向键 |
 
 ### 多人同步（SharedRoom / MQTT，复用 DECIDER Phase2 旧项目方案）
@@ -26,7 +26,7 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 - 连接地址（顺序尝试）：`wss://broker.emqx.io:8084/mqtt` → `wss://broker.hivemq.com:8884/mqtt`；房间 = topic `gridwalker/phase2/<ROOM>`（`?room=` URL 参数可覆盖，默认 `GRIDWALKER`）
 - 每台手机只写自己的 `me`（x/y/color/携带/交付），`net.js` 以 pstate 消息广播（兼 1.5 秒心跳）；其他玩家从 `guests` 读取渲染；4 秒无消息自动移除
 - JOIN 反馈：Connecting… / Connected ✓ / Connection Failed（附具体原因）
-- 新玩家自动分配颜色与出生点（最多 7 人）；加入/离开/断线重连由 `net.js` 处理（hello / bye / 心跳超时 / mqtt 自动重连）
+- 新玩家自动分配颜色与出生点（30 种颜色 + 30 个出生点，最多 30 人）；加入/离开/断线重连由 `net.js` 处理（hello / bye / 心跳超时 / mqtt 自动重连）
 - HUD 显示连接状态与在线人数
 
 ### 占地（Territory）
@@ -40,7 +40,7 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 
 ### Object（拾取 / 携带 / 交付）
 
-- 地图中央 4 个公共 Object（o1–o4，固定位置）；空手进入 Object 格自动拾取，每人最多携带一个
+- 地图中部动态生成 Object（数量按参与人数查表 2~13 个，Emoji 视觉）；空手进入 Object 格自动拾取，每人最多携带一个
 - `shared.objects[objId] = { state, by }`（ground / carried / delivered）同步给所有手机；`me.carryingObject` 记录 Object ID
 - 携带者头顶显示金色 Object 标记（所有玩家可见）；携带时移动不占地
 - 基地 = 出生点（`me.baseX/baseY`）；携带回到自己基地自动交付 → Object 标记 delivered（暂不刷新），`me.delivered` +1，恢复占地
@@ -49,13 +49,21 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 - **同时拾取/抢夺**：MQTT 公共 broker 没有 CAS 或服务端裁决 API；采用「宣告 + 回滚」——各设备按 (ts,id) 统一裁决出唯一携带者，输家自动放下（最终一致，有亚秒级双携带过渡窗口，非严格互斥）。已交付的 Object 由交付者守护，不被迟到的抢夺宣告复活。详见 `sketch.js` 头部注释
 - `claimObject(objId)` 即所有权转移入口（拾取与抢夺共用）
 
-### 赛制（倒计时 / 计分 / 排名）
+### 赛制（READY / 倒计时 / 计分 / 排名）
 
-- 房间内任一玩家点 **START** 开始比赛（大厅阶段不能移动/占地/拾取/抢夺）
-- 每局 120 秒：倒计时由共享状态驱动（`shared.game = { phase, round, startAt }`），各设备在收到 running 时以本地时刻锁定起点、等长计时；任一台倒计时归零写 ended，所有设备同时冻结
+- 房间内每名玩家点 **READY** 切换准备状态；至少 2 名玩家且全员就绪后自动进入 3 秒倒计时（3 · 2 · 1 · GO!），随后统一开始 120 秒比赛
+- 倒计时期间有人取消准备 / 断线 / 新玩家加入 → 自动取消并回到等待状态
+- 比赛开始时锁定本局参与者名单：中途加入者观战（不能移动/占地/拾取/抢夺/交付，不参与计分）；PLAY AGAIN 后所有人恢复 Not Ready
+- 每局 120 秒：倒计时由共享状态驱动（`shared.game = { phase, round, startAt, readyAt, participants, objects }`），各设备在收到 running 时以本地时刻锁定起点、等长计时；任一台归零写 ended，所有设备同时冻结
 - 结束后：完整领地小地图 + 排名 + 得分明细（领地每格 +1，交付 Object 每个 +30，结束时仍携带每个 +15）；比赛中不显示任何人的总分/排名
-- **PLAY AGAIN**：清空地图与物品、所有玩家回基地并清空携带/交付数，回到大厅
-- 同时 START / 结束 / PLAY AGAIN：同 key 覆盖 + 局号去重（每局每台只重置/锁定一次），收敛到同一份状态
+- **PLAY AGAIN**：清空地图与物品、所有玩家回基地并清空携带/交付数、恢复 Not Ready，回到大厅
+- 同时 READY / 结束 / PLAY AGAIN：阶段转换写入 + (ts,id) LWW 收敛 + 局号去重（每局每台只重置/锁定一次）
+
+### Object（动态数量 + Emoji）
+
+- 数量按本局参与人数查表：1–3 人 → 2 个，4–6 → 3，7–9 → 4，10–12 → 5，13–15 → 7，16–20 → 9，21–25 → 11，26–30 → 13
+- 布局（id / emoji / 坐标）在比赛开始时由共享状态 `shared.game.objects` 决定，所有设备完全一致；位置在地图中部区域随机不重叠、避开出生点；PLAY AGAIN 后按新人数重新生成
+- 每个 Object 用不同 Emoji（📺📻📷🎮💻📱🎸🧸📼💿📚🕹️🎧），地上有轻微浮动动画，携带者头顶显示对应 Emoji
 
 ### 联机（SharedRoom，无需自建服务器）
 

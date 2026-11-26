@@ -59,7 +59,7 @@ body {
   min-height: 16px;
 }
 
-/* ---- 操作区：底部一行 JOIN + START + CALIBRATE ---- */
+/* ---- 操作区：底部一行 JOIN + READY ---- */
 #controls {
   flex: 0 0 auto;
   width: 100%;
@@ -68,7 +68,7 @@ body {
   padding: 8px 12px calc(10px + env(safe-area-inset-bottom, 0px));
 }
 
-/* 按钮行：三个按钮均分宽度，清晰可见、便于拇指点按 */
+/* 按钮行：两个按钮均分宽度，清晰可见、便于拇指点按 */
 #control-top {
   display: flex;
   gap: 10px;

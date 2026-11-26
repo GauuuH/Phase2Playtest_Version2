@@ -82,28 +82,48 @@
  *   已交付的 Object 由交付者本会话守护（assertDelivered），
  *   被迟到的抢夺宣告复活时重新写回 delivered。
  *
- * ── 赛制：倒计时 / 计分 / 排名（已实现）──
- *   shared.game = { phase: 'lobby'|'running'|'ended', round: 局号, startAt: 启动者时钟 }
- *   · START：任一玩家写 { running, round+1, startAt }；PLAY AGAIN 写
- *     { lobby, round+1 } + 清空 cells/objects；所有设备在“看到新局号”时
- *     自我重置（各写各的 me，不替别人写）；
+ * ── 赛制：READY 准备 → 3 秒倒计时 → 120 秒比赛 / 计分 / 排名 ──
+ *   shared.game = { phase: 'lobby'|'countdown'|'running'|'ended', round, startAt,
+ *                   readyAt, participants[], objects[] }
+ *   · READY：每位玩家切换 me.ready（随 pstate 广播）；等待阶段显示
+ *     Ready: n/m。至少 2 名玩家且全员就绪后自动进入 countdown。
+ *   · countdown 的确定性启动（公共 broker 无原子事务，见下）：
+ *       1) 只有「全员就绪」的上升沿（false→true）且 phase=lobby 才写
+ *          { countdown, round, readyAt, participants }——多台同时写入时
+ *          由 (ts,id) LWW 收敛出唯一的 readyAt 与参与者名单；
+ *       2) 倒计时 3 秒期间任一玩家取消准备 / 断线 / 新玩家加入（默认
+ *          Not Ready）→ 任一设备检测到「非全员就绪」就写回 lobby 取消；
+ *       3) 倒计时归零 → 任何设备写 { running, round, startAt, participants,
+ *          objects[] }（与 countdown 同一名单，多写幂等，LWW 收敛）；
+ *       4) 所有写入都是「阶段转换」（先改本地阶段再广播），不会因消息
+ *          延迟重复触发；取消后需重新出现全员就绪上升沿才会再次倒计时。
+ *   · 比赛开始时锁定参与者名单：中途加入者不在名单内 → 观战（不能移动、
+ *     占地、拾取、抢夺、交付，也不参与计分）；下一局重新准备。
  *   · 倒计时同步：每台设备在首次看到 running(N) 时以“本地收到时刻”起算
  *     120 秒（消除设备时钟差，各设备等长计时；开赛误差 ≈ 网络延迟）；
  *     迟到加入/重载时 startAt 已过去较久 → 改用 startAt 反推剩余时间；
  *   · 结束：任何设备倒计时归零都写 { ended }（多台同时写同一值，
  *     各设备按 (ts, id) 统一裁决收敛，先写先冻结）；所有操作在非 running 阶段被冻结；
- *   · 计分（结束时从共享状态计算，所有设备结果一致）：
+ *   · 计分（结束时从共享状态计算，所有设备结果一致，只算本局参与者）：
  *     最终领地每格 +1；交付 Object 每个 +30；结束时仍携带每个 +15；
  *     比赛中不显示任何人的总分/排名，结束后才显示完整地图与明细；
- *   · 并发冲突（同时 START / 同时结束 / 同时 PLAY AGAIN）：
+ *   · 并发冲突（同时 READY / 同时结束 / 同时 PLAY AGAIN）：
  *     同 key 覆盖 + 局号去重（每台设备每个局号只重置/锁定一次），
  *     最终都收敛到同一份 game 状态。
  *
+ * ── Object 布局（动态数量，见 OBJECT_COUNT_FOR） ──
+ *   · 数量按本局参与者人数查表（2~13 个），比赛开始时生成并写入
+ *     shared.game.objects（同一局所有设备看到完全相同的 id/emoji/坐标）；
+ *   · 位置由共享状态决定（发起设备用带种子的 PRNG 生成），绝不由
+ *     每台手机各自随机；PLAY AGAIN 后按新人数重新生成；
+ *   · Emoji 仅作视觉：id → OBJECT_EMOJIS 下标映射，不进入同步逻辑。
+ *
  * ── 操作方式（手机） ──
  *   · Swipe：画面上滑/下滑，每次移动一格
- *   · Tilt ：左右倾斜横向移动（死区 + 定间隔），CALIBRATE 校准中立角
+ *   · Tilt ：左右倾斜横向移动（死区 + 定间隔），权限自动请求、
+ *            以首次读数自动校准中立角（无 CALIBRATE 按钮）
  *   · Two-Finger Tap：抢夺其他玩家携带的 Object
- *   · JOIN：加入共享房间
+ *   · JOIN / READY：加入房间 / 切换准备状态（同时也是传感器授权入口）
  * ── 操作方式（桌面调试） ──
  *   · 方向键 / WASD
  * ============================================================ */
@@ -150,7 +170,7 @@ const WORLD_H = GRID * CELL;  // 地图总高 960px（大于手机屏幕）
 /* ---------------- 操作配置 ---------------- */
 const SWIPE_DIST   = 30;    // 滑动判定距离（px）
 const TILT_DEADZONE = 5;    // 倾斜死区（°），防止手抖误触发
-const TILT_INTERVAL = 220;  // 倾斜越过死区后的固定移动间隔（ms）
+const TILT_INTERVAL = 180;  // 倾斜越过死区后的固定移动间隔（ms），配合平滑动画更自然
 const TILT_SIGN = 1;        // 个别设备若左右方向颠倒，改成 -1
 
 /* ---------------- 赛制配置 ---------------- */
@@ -158,15 +178,22 @@ let GAME_DURATION = 120000;  // 每局时长（ms）= 120 秒；测试时可临�
 const SCORE_CELL = 1;        // 最终领地每格 1 分
 const SCORE_DELIVERED = 30;  // 交付一个 Object 30 分
 const SCORE_CARRIED = 15;    // 结束时仍携带一个 Object 15 分
+const READY_COUNTDOWN_MS = 3000;   // 全员就绪后的统一开赛倒计时（3 秒）
+const READY_MIN_PLAYERS = 2;       // 联机模式至少 2 人才能开始
+
+/* ---------------- 移动平滑（视觉坐标，逻辑坐标仍是整数格） ---------------- */
+const MOVE_SMOOTH_K = 16;   // 玩家视觉位置追赶速率（1/s），约 90% 收敛 ≈ 145ms
+const CAM_SMOOTH_K  = 10;   // 摄像机平滑速率（1/s），比玩家略慢、避免抖动
 
 /* ---------------- 联机配置（SharedRoom / MQTT，实现见 js/net.js） ---------------- */
 const SHARE_CONFIG = {
   room: 'GRIDWALKER'   // 房间名：同一房间的手机互相可见（?room= URL 参数可覆盖）
 };
 
-const MAX_PLAYERS = 7;   // 架构预留：最多 7 名玩家（先支持 2 部手机测试）
+const MAX_PLAYERS = 30;   // 设计容量：最多 30 名玩家（需实际压力测试）
 
-/* 7 种玩家颜色（下标 = 颜色编号，全部设备一致） */
+/* 30 种玩家颜色（下标 = 颜色编号，全部设备一致）：前 7 个保持原样，
+ * 其余按色相环铺开并交替明度，保证相邻编号视觉可区分 */
 const PALETTE = [
   [255, 118, 87],    // 0 珊瑚红
   [255, 199, 89],    // 1 琥珀
@@ -174,34 +201,127 @@ const PALETTE = [
   [151, 220, 121],   // 3 草绿
   [206, 131, 255],   // 4 紫
   [255, 140, 199],   // 5 粉
-  [117, 230, 218]    // 6 青
+  [117, 230, 218],   // 6 青
+  [255, 90, 60],     // 7 红橙
+  [90, 130, 255],    // 8 蓝
+  [70, 200, 120],    // 9 绿
+  [255, 210, 80],    // 10 金黄
+  [200, 100, 255],   // 11 蓝紫
+  [255, 100, 150],   // 12 玫红
+  [100, 200, 220],   // 13 湖蓝
+  [180, 150, 255],   // 14 淡紫
+  [255, 160, 100],   // 15 杏橙
+  [150, 220, 90],    // 16 黄绿
+  [120, 160, 255],   // 17 天蓝 2
+  [240, 110, 200],   // 18 品红
+  [90, 220, 190],    // 19 海绿
+  [220, 130, 70],    // 20 棕橙
+  [130, 100, 200],   // 21 紫 2
+  [200, 210, 90],    // 22 橄榄
+  [90, 190, 250],    // 23 浅蓝
+  [230, 150, 130],   // 24 肉粉
+  [110, 190, 130],   // 25 灰绿
+  [200, 120, 220],   // 26 兰紫
+  [150, 130, 90],    // 27 卡其
+  [120, 220, 160],   // 28 薄荷
+  [240, 180, 120]    // 29 浅橙
 ];
 
-/* 7 个出生点（下标 = 颜色编号，所有设备一致）；同时是各玩家的基地。
- * 全部在地图外围（不允许出生在中央），且到中央 Object 区最近一格的
- * 曼哈顿距离都等于 11（8 个等距候选点中取 7 个），保证公平。 */
+/* 30 个出生点（下标 = 颜色编号，所有设备一致）；同时是各玩家的基地。
+ * 前 7 个保持原公平布局（到中央 Object 区最近一格曼哈顿距离 = 11），
+ * 其余沿地图四边均匀铺开，尽量分散、互不重叠。 */
 const SPAWNS = [
-  { x: 0,  y: 9  },   // 左
-  { x: 23, y: 9  },   // 右
-  { x: 0,  y: 14 },   // 左
-  { x: 23, y: 14 },   // 右
-  { x: 9,  y: 0  },   // 上
-  { x: 14, y: 0  },   // 上
-  { x: 9,  y: 23 }    // 下
+  { x: 0,  y: 9  },   // 0 左
+  { x: 23, y: 9  },   // 1 右
+  { x: 0,  y: 14 },   // 2 左
+  { x: 23, y: 14 },   // 3 右
+  { x: 9,  y: 0  },   // 4 上
+  { x: 14, y: 0  },   // 5 上
+  { x: 9,  y: 23 },   // 6 下
+  { x: 0,  y: 2  },   // 7 左
+  { x: 23, y: 21 },   // 8 右
+  { x: 4,  y: 0  },   // 9 上
+  { x: 19, y: 0  },   // 10 上
+  { x: 4,  y: 23 },   // 11 下
+  { x: 19, y: 23 },   // 12 下
+  { x: 0,  y: 4  },   // 13 左
+  { x: 23, y: 19 },   // 14 右
+  { x: 7,  y: 0  },   // 15 上
+  { x: 16, y: 0  },   // 16 上
+  { x: 7,  y: 23 },   // 17 下
+  { x: 16, y: 23 },   // 18 下
+  { x: 0,  y: 6  },   // 19 左
+  { x: 23, y: 17 },   // 20 右
+  { x: 11, y: 0  },   // 21 上
+  { x: 12, y: 0  },   // 22 上
+  { x: 11, y: 23 },   // 23 下
+  { x: 12, y: 23 },   // 24 下
+  { x: 0,  y: 16 },   // 25 左
+  { x: 23, y: 7  },   // 26 右
+  { x: 21, y: 0  },   // 27 上
+  { x: 2,  y: 0  },   // 28 上
+  { x: 2,  y: 23 }    // 29 下
 ];
 
-/* 4 个公共 Object：唯一 ID + 固定初始位置（地图中央区域，避开出生点） */
-const OBJECTS = [
-  { id: 'o1', x: 10, y: 10 },
-  { id: 'o2', x: 13, y: 10 },
-  { id: 'o3', x: 10, y: 13 },
-  { id: 'o4', x: 13, y: 13 }
+/* Object 视觉：唯一 ID（o1..o13）→ Emoji 下标固定映射，所有设备一致。
+ * Emoji 仅作为视觉资源，不进入同步逻辑。 */
+const OBJECT_EMOJIS = [
+  '📺', '📻', '📷', '🎮', '💻', '📱', '🎸',
+  '🧸', '📼', '💿', '📚', '🕹️', '🎧'
 ];
+
+/* 动态 Object 数量：按本局参与玩家人数查表 */
+function objectCountFor(playerCount) {
+  if (playerCount <= 3) return 2;
+  if (playerCount <= 6) return 3;
+  if (playerCount <= 9) return 4;
+  if (playerCount <= 12) return 5;
+  if (playerCount <= 15) return 7;
+  if (playerCount <= 20) return 9;
+  if (playerCount <= 25) return 11;
+  return 13;
+}
+
+/* 带种子 PRNG（mulberry32）：布局生成可复现，但实际以共享状态为准 */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* 生成一局 Object 布局：数量查表；位置在地图中部区域（x,y ∈ [3,20]，
+ * 天然避开四周出生点）随机取不重叠格子。结果写入 shared.game.objects，
+ * 所有设备读取同一份布局，绝不各自随机。 */
+function generateObjectLayout(round, playerCount) {
+  const count = objectCountFor(playerCount);
+  const rng = mulberry32(((round * 7919 + playerCount * 131) | 0) >>> 0);
+  const cands = [];
+  for (let y = 3; y <= 20; y++) {
+    for (let x = 3; x <= 20; x++) cands.push({ x: x, y: y });
+  }
+  const objs = [];
+  for (let i = 0; i < count && i < cands.length; i++) {
+    const j = i + Math.floor(rng() * (cands.length - i));
+    const t = cands[i]; cands[i] = cands[j]; cands[j] = t;
+    objs.push({
+      id: 'o' + (i + 1),
+      emoji: OBJECT_EMOJIS[i % OBJECT_EMOJIS.length],
+      x: cands[i].x,
+      y: cands[i].y
+    });
+  }
+  return objs;
+}
 
 /* ---------------- 游戏状态（摄像机等本地状态） ---------------- */
 /* 玩家状态不在本地对象里：自己在 net.js 维护的 me 里，他人在 guests 里 */
 const gameState = {
-  camera: { x: 0, y: 0 }   // 摄像机左上角的世界坐标（像素）
+  camera: { x: 0, y: 0 },       // 摄像机左上角的世界坐标（像素）
+  render: { x: 0, y: 0 }        // 本机角色的视觉坐标（像素，平滑过渡用）
 };
 
 /* ---------------- 赛制本地状态（不同步，纯本机） ---------------- */
@@ -210,7 +330,9 @@ const game = {
   lastPhase: null,      // 本机上次看到的阶段（用于锁定 running 的进入沿）
   localStartAt: 0,      // 本机倒计时起点（本地时钟，收到 running 时锁定）
   lastResetRound: -1,   // 已执行自我重置的局号（每局只重置一次）
-  scores: null          // 结束后每帧从共享状态重算（冻结期保持最新）
+  scores: null,         // 结束后每帧从共享状态重算（冻结期保持最新）
+  lastAllReady: null,   // 全员就绪上升沿检测（false→true 才触发倒计时）
+  goFlashUntil: 0       // running 刚开始时显示 GO! 的时间戳
 };
 
 /* ---------------- 倾斜传感器状态 ---------------- */
@@ -222,8 +344,7 @@ const sensors = {
   latest: null,            // 最近一次左右倾斜角度（°）
   neutral: null,           // 校准后的中立角度（°）
   calibrated: false,
-  calibratePressed: false,
-  pendingCalibrate: false, // 按下校准时还没数据 → 等第一条数据到达再校准
+  pendingCalibrate: false, // 等第一条数据到达后自动校准
   dir: 0,                  // 当前倾斜方向：-1 左 / 0 停 / 1 右
   lastMoveAt: 0            // 上次倾斜移动的时间（millis）
 };
@@ -261,7 +382,8 @@ function onlineCount() {
 function gamePhase() {
   const g = window.shared.game;
   if (!g) return 'lobby';
-  return g.phase === 'running' ? 'running' : g.phase === 'ended' ? 'ended' : 'lobby';
+  const p = g.phase;
+  return (p === 'running' || p === 'ended' || p === 'countdown') ? p : 'lobby';
 }
 
 function gameRound() {
@@ -271,6 +393,58 @@ function gameRound() {
 
 function gameIsRunning() {
   return gamePhase() === 'running';
+}
+
+/* 本局参与者名单（共享状态，比赛开始时锁定） */
+function gameParticipants() {
+  const g = window.shared.game;
+  if (g && Array.isArray(g.participants) && g.participants.length > 0) {
+    return g.participants.map(String);
+  }
+  return [];
+}
+
+/* 我是本局参与者吗（决定能否移动/计分） */
+function amIParticipant() {
+  if (!isShareConfigured()) return true;   // 单机/诊断：无观战概念
+  const ids = gameParticipants();
+  if (ids.length === 0) return true;       // 尚未锁定名单（lobby）：都在
+  return ids.indexOf(myOwnerId()) >= 0;
+}
+
+/* 观战者：比赛中途加入、不在本局参与者名单内 */
+function isSpectator() {
+  if (!isShareConfigured()) return false;
+  return gamePhase() === 'running' && !amIParticipant();
+}
+
+/* 当前在线玩家 id 列表（自己 + guests，按字典序排序，各设备一致） */
+function currentParticipantIds() {
+  const ids = [myOwnerId()];
+  const gs = window.guests || [];
+  for (const g of gs) {
+    if (String(g.id)) ids.push(String(g.id));
+  }
+  ids.sort();
+  return ids;
+}
+
+/* 全员就绪判定：自己 + 所有在线玩家都 READY，且（联机时）至少 2 人 */
+function allPlayersReady() {
+  if (!me.ready) return false;
+  const gs = window.guests || [];
+  for (const g of gs) {
+    if (!g.ready) return false;
+  }
+  if (isShareConfigured() && onlineCount() < READY_MIN_PLAYERS) return false;
+  return true;
+}
+
+function readyCount() {
+  let n = me.ready ? 1 : 0;
+  const gs = window.guests || [];
+  for (const g of gs) if (g.ready) n++;
+  return n;
 }
 
 function remainingMs() {
@@ -300,9 +474,16 @@ function resetMyPlayer() {
   }
   me.carryingObject = null;
   me.delivered = 0;
+  me.ready = false;              // 新一局：所有人恢复 Not Ready
   steal.deliveredByMe.clear();
+  window.guestsOffline = [];     // 清掉上一局的离线快照
   game.scores = null;
   game.localStartAt = 0;
+  game.lastAllReady = null;
+  game.goFlashUntil = 0;
+  // 视觉坐标直接落位到基地（回基地不跨图滑行）
+  gameState.render.x = (me.baseX != null ? me.baseX : me.x) * CELL + CELL / 2;
+  gameState.render.y = (me.baseY != null ? me.baseY : me.y) * CELL + CELL / 2;
 }
 
 // 每帧调用：局号推进 / 倒计时锁定 / 结束 / 计分
@@ -312,26 +493,27 @@ function updateGameFlow() {
   const round = typeof g.round === 'number' ? g.round : 0;
   const phase = gamePhase();
 
-  // 新一局（lobby 或 running）→ 每台设备自我重置一次（同时处理
-  // START 与 PLAY AGAIN 的竞态：以最终看到的局号为准，只重置一次）
+  // 新一局（lobby / countdown / running）→ 每台设备自我重置一次（同时处理
+  // PLAY AGAIN 与中途加入的竞态：以最终看到的局号为准，只重置一次）
   if (phase !== 'ended' && round !== game.lastResetRound) {
     game.lastResetRound = round;
     resetMyPlayer();
   }
 
   // 进入 running（以“阶段沿”为准，而不是局号：PLAY AGAIN 换局后
-  // START 沿用同一局号，阶段从 lobby → running 也必须重新锁定）
+  // 阶段从 lobby → countdown → running 也必须重新锁定）
   if (phase === 'running' && game.lastPhase !== 'running') {
     game.lastPhase = 'running';
     game.localRound = round;
+    game.goFlashUntil = Date.now() + 900;   // 开局显示 GO!
     // 正常开赛：以“本地收到时刻”起算，消除设备时钟差（各设备等长计时）；
     // 迟到加入 / 重载：startAt 已过去较久 → 用 startAt 反推剩余时间
     const late = typeof g.startAt === 'number' && Date.now() - g.startAt > 1500;
     game.localStartAt = late ? g.startAt : Date.now();
     // 开赛瞬间：占下自己的出生格（基地）。捕获“基地格”而不是“当前格”，
     // 不受帧时机影响——即使玩家在 latch 前已移动，出生格也自动归自己，
-    // 路径格由移动本身完成占地。
-    if (me.baseX != null && me.baseY != null) captureCell(me.baseX, me.baseY);
+    // 路径格由移动本身完成占地。观战者不占地。
+    if (!isSpectator() && me.baseX != null && me.baseY != null) captureCell(me.baseX, me.baseY);
   } else if (phase !== 'running') {
     game.lastPhase = phase;
     game.localRound = round;
@@ -346,6 +528,70 @@ function updateGameFlow() {
   // 结束后每帧从共享状态重算（冻结期若有迟到的裁决补丁，结果保持最新）
   if (phase === 'ended') {
     game.scores = computeScores();
+  }
+}
+
+/* ============================================================
+ * READY 流程 —— 确定性开赛仲裁（公共 MQTT broker 无原子事务）
+ *   全员就绪上升沿（false→true，且 phase=lobby）→ 写 countdown；
+ *   countdown 期间非全员就绪 → 写 lobby 取消；
+ *   countdown 归零 → 写 running（参与者名单沿用 countdown 的名单）。
+ *   每一步都是阶段转换：先改本地 phase 再广播，(ts,id) LWW 收敛，
+ *   不会因消息延迟重复触发（取消后必须重新出现上升沿才会再倒计时）。
+ * ============================================================ */
+function updateReadyFlow() {
+  if (isShareConfigured() && !isConnected()) return;   // 未连接：不参与仲裁
+  const g = window.shared.game;
+  const round = gameRound();
+  const p = gamePhase();
+
+  if (p === 'lobby') {
+    const allReady = allPlayersReady();
+    if (allReady && game.lastAllReady !== true) {
+      game.lastAllReady = true;   // 上升沿：只写一次
+      window.shared.game = {
+        phase: 'countdown',
+        round: round,
+        readyAt: Date.now(),
+        participants: currentParticipantIds()
+      };
+    } else if (!allReady) {
+      game.lastAllReady = false;
+    }
+    return;
+  }
+
+  if (p === 'countdown') {
+    const readyAt = (typeof g.readyAt === 'number') ? g.readyAt : Date.now();
+    const remain = READY_COUNTDOWN_MS - (Date.now() - readyAt);
+
+    // 取消：有人取消准备 / 断线 / 新玩家加入（默认 Not Ready）
+    if (!allPlayersReady()) {
+      game.lastAllReady = false;
+      window.shared.game = { phase: 'lobby', round: round, participants: [] };
+      return;
+    }
+
+    // 到点：统一开赛。多台同时写 running（同一 round、同一名单），
+    // (ts,id) LWW 收敛出唯一 startAt 与 Object 布局
+    if (remain <= 0) {
+      const ids = (g.participants && g.participants.length > 0)
+        ? g.participants.map(String)
+        : currentParticipantIds();
+      window.shared.game = {
+        phase: 'running',
+        round: round,
+        startAt: Date.now(),
+        participants: ids,
+        objects: generateObjectLayout(round, ids.length)
+      };
+    }
+    return;
+  }
+
+  // running / ended：记录当前就绪态（用于下一局 lobby 的上升沿检测）
+  if (p === 'ended') {
+    game.lastAllReady = false;
   }
 }
 
@@ -372,21 +618,39 @@ function scoreOf(p) {
   };
 }
 
-function computeScores() {
-  const list = [];
-  list.push(scoreOf({
-    id: myOwnerId(),
-    color: typeof me.color === 'number' ? me.color : 0,
-    delivered: me.delivered
-  }));
+/* 按 id 找玩家快照：先自己，再在线 guests，最后离线快照（比赛中断线的参与者） */
+function playerSnapshotFor(id) {
+  if (String(id) === myOwnerId()) {
+    return { id: String(id), color: me.color, delivered: me.delivered };
+  }
   const gs = window.guests || [];
   for (const g of gs) {
-    if (typeof g.color !== 'number' || g.color < 0) continue;
-    list.push(scoreOf({
-      id: String(g.id),
-      color: g.color,
-      delivered: g.delivered
-    }));
+    if (String(g.id) === String(id)) {
+      return { id: String(id), color: g.color, delivered: g.delivered };
+    }
+  }
+  const off = window.guestsOffline || [];
+  for (const o of off) {
+    if (String(o.id) === String(id)) {
+      return { id: String(id), color: o.color, delivered: o.delivered };
+    }
+  }
+  return null;
+}
+
+/* 只给本局参与者计分（中途加入的观战者不参与本局排名） */
+function computeScores() {
+  const ids = gameParticipants();
+  if (ids.length === 0) return [];
+  const list = [];
+  const seen = new Set();
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const p = playerSnapshotFor(id);
+    if (!p) continue;
+    if (typeof p.color !== 'number' || p.color < 0) p.color = 0;
+    list.push(scoreOf(p));
   }
   list.sort((a, b) => b.total - a.total || a.color - b.color);   // 同分按颜色下标稳定排序，各设备排名一致
   return list;
@@ -397,6 +661,7 @@ function gameStatusText() {
   const p = gamePhase();
   if (p === 'running') return 'Time: ' + Math.ceil(remainingMs() / 1000) + 's';
   if (p === 'ended') return "Time's Up";
+  if (p === 'countdown') return 'Starting…';
   return 'Waiting for Players';
 }
 
@@ -407,6 +672,7 @@ function gameStatusText() {
  * ============================================================ */
 function moveMe(dx, dy) {
   if (!gameIsRunning()) return;   // 比赛未开始 / 已结束：冻结，不能移动
+  if (isSpectator()) return;      // 中途加入的观战者不能移动/占地/拾取
   const nx = constrain(me.x + dx, 0, GRID - 1);
   const ny = constrain(me.y + dy, 0, GRID - 1);
   if (nx === me.x && ny === me.y) return;   // 没动（顶墙）：不占地、不拾取
@@ -466,20 +732,54 @@ function myCellCount() {
  * Object 系统 —— shared.objects[objId] = { state, by }
  *   state: 'ground'（在地上）| 'carried'（被携带）| 'delivered'（已交付）
  *   by    : 当前携带者 ID（ground 时无此字段）
+ * 布局（id / emoji / 坐标）在 shared.game.objects，比赛开始时生成并锁定。
  * ============================================================ */
 
-// 每帧调用：补齐缺失的 Object 条目（老房间/新加入时自愈）
+/* 本局 Object 布局（共享状态，所有设备一致） */
+function gameObjects() {
+  const g = window.shared.game;
+  if (g && Array.isArray(g.objects)) return g.objects;
+  return [];
+}
+
+function objectById(id) {
+  const objs = gameObjects();
+  for (const o of objs) {
+    if (o.id === id) return o;
+  }
+  return null;
+}
+
+/* Object ID → Emoji（id 的编号与 OBJECT_EMOJIS 下标固定映射，
+ * 不同设备对同一 ID 必然显示相同 Emoji；仅视觉，不参与同步） */
+function objectEmoji(id) {
+  const o = objectById(id);
+  if (o && typeof o.emoji === 'string' && o.emoji.length > 0) return o.emoji;
+  const m = /^o(\d+)$/.exec(String(id));
+  const idx = m ? (parseInt(m[1], 10) - 1) : 0;
+  return OBJECT_EMOJIS[((idx % OBJECT_EMOJIS.length) + OBJECT_EMOJIS.length) % OBJECT_EMOJIS.length];
+}
+
+// 每帧调用：按本局布局补齐/清理 Object 条目（中途加入/断线重连时自愈）
 function healObjects() {
   if (!window.shared.objects) window.shared.objects = {};
-  for (const o of OBJECTS) {
+  const objs = gameObjects();
+  const ids = new Set();
+  for (const o of objs) {
+    ids.add(o.id);
     if (!window.shared.objects[o.id]) {
       window.shared.objects[o.id] = { state: 'ground' };
     }
   }
+  // 清理不在本局布局里的陈旧条目（只做本地清理，不广播）
+  for (const k of Object.keys(window.shared.objects)) {
+    if (!ids.has(k)) delete window.shared.objects[k];
+  }
 }
 
 function objectAt(x, y) {
-  for (const o of OBJECTS) {
+  const objs = gameObjects();
+  for (const o of objs) {
     if (o.x === x && o.y === y) return o;
   }
   return null;
@@ -493,15 +793,16 @@ function tryPickup(x, y) {
   const st = window.shared.objects && window.shared.objects[obj.id];
   if (!st || st.state !== 'ground') return;   // 已被人拿走 / 已交付
   claimObject(obj.id);
-  setStealFeedback('Object Collected · ' + obj.id, FEEDBACK_OK);
+  setStealFeedback('Object Collected · ' + objectEmoji(obj.id) + ' ' + obj.id, FEEDBACK_OK);
 }
 
-/* 拾取宣告（同时是未来双指抢夺的转移入口，本阶段不接线）：
+/* 拾取宣告（同时是双指抢夺的转移入口）：
  * 写入 { carried, by:我的ID }；若同时有人抢同一 Object，
  * 各设备按 (ts, id) 统一裁决出唯一 by，输家由 resolveObjectConflicts() 自动放下。 */
 function claimObject(objId) {
   const mine = myOwnerId();
   if (!mine) return;
+  if (!objectById(objId)) return;   // 不在本局布局：忽略陈旧宣告
   if (!window.shared.objects) window.shared.objects = {};
   window.shared.objects[objId] = { state: 'carried', by: mine };
   me.carryingObject = objId;   // 记录 Object ID（不是 true/false）
@@ -517,6 +818,11 @@ function tryDeliver(x, y) {
   const st = window.shared.objects && window.shared.objects[objId];
   if (!st || st.state !== 'carried' || st.by !== myOwnerId()) {
     // 我其实没抢到（裁决输给了别人）→ 放下即可，不交付
+    me.carryingObject = null;
+    return;
+  }
+  if (!objectById(objId)) {
+    // 携带的是上一局的陈旧 Object（新局布局已变）→ 直接放下
     me.carryingObject = null;
     return;
   }
@@ -605,6 +911,10 @@ function trySteal() {
     setStealFeedback('Game not started', FEEDBACK_FAIL);
     return;
   }
+  if (isSpectator()) {
+    setStealFeedback('Spectator · cannot steal', FEEDBACK_FAIL);
+    return;
+  }
   if (me.carryingObject) {
     setStealFeedback('Hands Full', FEEDBACK_FAIL);
     return;
@@ -625,7 +935,7 @@ function trySteal() {
     return;
   }
   claimObject(objId);   // 所有权转移：原携带者会自动放下
-  setStealFeedback('Object Stolen · ' + objId + '!', FEEDBACK_OK);
+  setStealFeedback('Object Stolen · ' + objectEmoji(objId) + ' ' + objId + '!', FEEDBACK_OK);
 }
 
 // 每帧调用：守护“已交付”状态 —— 若我交付过的 Object 被迟到的抢夺宣告
@@ -661,21 +971,22 @@ function drawStealFeedback() {
   text(steal.feedback.text, cx, cy);
 }
 
-/* 结算界面（仅 ended 阶段）：完整领地小地图 + 排名 + 得分明细 */
+/* 结算界面（仅 ended 阶段）：完整领地小地图 + 排名 + 得分明细。
+ * 参与者最多 30 人：排行榜压缩显示，最多展示前 16 名 + “+N more”。 */
 function drawResults() {
   if (gamePhase() !== 'ended') return;
   const sc = game.scores || [];
 
   // 遮罩
   noStroke();
-  fill(0, 0, 0, 0.66);
+  fill(0, 0, 0, 0.72);
   rect(0, 0, width, height);
 
   // 完整 24×24 领地小地图（按主人颜色缩放绘制）
-  const mapSize = Math.min(width, height) * 0.36;
+  const mapSize = Math.min(width * 0.86, height * 0.3);
   const cs = mapSize / GRID;
   const mx = (width - mapSize) / 2;
-  const my = 22;
+  const my = 20;
   for (let y = 0; y < GRID; y++) {
     for (let x = 0; x < GRID; x++) {
       const c = cellOwner(x, y);
@@ -693,27 +1004,34 @@ function drawResults() {
   strokeWeight(1);
   rect(mx, my, mapSize, mapSize);
 
-  // 排名与明细
+  // 排名与明细（压缩行高，最多 16 行）
+  const MAX_ROWS = 16;
   textAlign(LEFT, TOP);
-  let ty = my + mapSize + 18;
-  textSize(17);
+  let ty = my + mapSize + 10;
+  textSize(16);
   fill(255, 209, 102);
   text('Final Results', 16, ty);
-  ty += 30;
-  for (let i = 0; i < sc.length; i++) {
+  ty += 24;
+  const rows = Math.min(sc.length, MAX_ROWS);
+  for (let i = 0; i < rows; i++) {
     const p = sc[i];
     const col = PALETTE[p.color % PALETTE.length];
     const isMe = p.id === myOwnerId();
     noStroke();
     fill(col[0], col[1], col[2]);
-    circle(24, ty + 6, 10);
+    circle(24, ty + 5, 10);
     fill(255);
-    textSize(13);
+    textSize(12);
     text((i + 1) + '. ' + (isMe ? 'YOU' : 'P' + (p.color + 1)) + '  ' + p.total + ' pts', 40, ty);
     fill(205, 205, 215);
+    textSize(10);
+    text('Territory ' + p.cells + ' · Delivered ' + p.delivered + '×30 · Carried ' + p.carried + '×15', 40, ty + 15);
+    ty += 24;
+  }
+  if (sc.length > rows) {
+    fill(205, 205, 215);
     textSize(11);
-    text('Territory ' + p.cells + ' + Delivered ' + p.delivered + '×30 + Carried ' + p.carried + '×15', 40, ty + 17);
-    ty += 38;
+    text('+' + (sc.length - rows) + ' more players…', 40, ty + 2);
   }
 }
 
@@ -773,13 +1091,50 @@ function ensureMyColor() {
     me.y = s.y;
     me.baseX = s.x;   // 基地 = 出生点（随 me 同步给其他玩家）
     me.baseY = s.y;
+    // 视觉坐标直接落位到出生点（避免跨图滑行）
+    gameState.render.x = (s.x + 0.5) * CELL;
+    gameState.render.y = (s.y + 0.5) * CELL;
     captureCell(s.x, s.y);   // 出生格子自动归自己所有
   }
 }
 
 /* ============================================================
- * 摄像机 —— Camera Follow（只跟随自己的角色 me）
+ * 摄像机与视觉坐标 —— Camera Follow（只跟随自己的角色 me）
+ * 逻辑坐标 me.x/me.y 保持整数格（占地/拾取/抢夺/交付的判断基础）；
+ * 视觉坐标 gameState.render 用指数平滑追赶目标格：
+ *   render += (target - render) * (1 - e^(-k·dt))
+ * 基于 deltaTime，与帧率无关；k=16 时约 145ms 收敛 90%（120–160ms
+ * 目标区间），ease-out 缓动，连续移动自然衔接、无逐格停顿。
+ * 其他玩家的位置同样在本地插值（网络只发逻辑坐标，不发视觉坐标）。
  * ============================================================ */
+function frameDelta() {
+  // p5 的 deltaTime（毫秒），钳制上限避免切后台回来时的大跳变
+  return Math.min((typeof deltaTime === 'number' && deltaTime > 0 ? deltaTime : 16.7), 50) / 1000;
+}
+
+function smoothStep(cur, target, k, dt) {
+  return cur + (target - cur) * (1 - Math.exp(-k * dt));
+}
+
+/* 每帧：本机角色 + 所有 guests 的视觉坐标向逻辑格平滑追赶 */
+function updateRender(dt) {
+  const tx = (me.x + 0.5) * CELL;
+  const ty = (me.y + 0.5) * CELL;
+  gameState.render.x = smoothStep(gameState.render.x, tx, MOVE_SMOOTH_K, dt);
+  gameState.render.y = smoothStep(gameState.render.y, ty, MOVE_SMOOTH_K, dt);
+
+  const gs = window.guests || [];
+  for (const g of gs) {
+    if (typeof g.rx !== 'number' || typeof g.ry !== 'number') {
+      g.rx = (g.x + 0.5) * CELL;
+      g.ry = (g.y + 0.5) * CELL;
+      continue;
+    }
+    g.rx = smoothStep(g.rx, (g.x + 0.5) * CELL, MOVE_SMOOTH_K, dt);
+    g.ry = smoothStep(g.ry, (g.y + 0.5) * CELL, MOVE_SMOOTH_K, dt);
+  }
+}
+
 function clampCam(tx, ty) {
   return {
     x: WORLD_W <= width  ? (WORLD_W - width)  / 2 : constrain(tx, 0, WORLD_W - width),
@@ -787,22 +1142,28 @@ function clampCam(tx, ty) {
   };
 }
 
-function camTarget(p) {
+function camTarget() {
   return {
-    x: p.x * CELL + CELL / 2 - width / 2,
-    y: p.y * CELL + CELL / 2 - height / 2
+    x: gameState.render.x - width / 2,
+    y: gameState.render.y - height / 2
   };
 }
 
-function updateCamera() {
+function updateCamera(dt) {
   const cam = gameState.camera;
-  const t   = clampCam(camTarget(me).x, camTarget(me).y);
-  cam.x = lerp(cam.x, t.x, 0.18);   // 平滑跟随
-  cam.y = lerp(cam.y, t.y, 0.18);
+  const t = clampCam(camTarget().x, camTarget().y);
+  cam.x = smoothStep(cam.x, t.x, CAM_SMOOTH_K, dt);   // 平滑跟随视觉坐标
+  cam.y = smoothStep(cam.y, t.y, CAM_SMOOTH_K, dt);
 }
 
 /* ============================================================
- * 倾斜传感器 —— 权限 / 校准 / 死区 / 定间隔移动
+ * 倾斜传感器 —— 自动授权 / 自动校准 / 死区 / 定间隔移动
+ * · 无需 CALIBRATE 按钮：首次读到传感器数据即以当前握持角度作为
+ *   中立角自动校准（不会产生突然移动）；
+ * · iOS 需要授权的设备：在用户点击 JOIN / READY 的用户手势里自动
+ *   调用 requestPermission()（只自动请求一次，不反复弹出）；
+ *   被拒绝后，再次点击 READY 会作为“重新授权入口”重试；
+ * · 权限失败不影响 JOIN / 联机 / 滑动操作。
  * ============================================================ */
 function needsSensorPermission() {
   return (
@@ -826,79 +1187,71 @@ function onDeviceOrientation(e) {
   const angle = Math.abs(screenAngle());
   const tilt = (angle === 90 || angle === 270) ? -b : g;  // 横屏时轴对调（降级）
 
+  const first = sensors.latest == null;
   sensors.latest = tilt * TILT_SIGN;
   sensors.available = true;
 
-  if (sensors.pendingCalibrate) {
+  // 首次读数（或授权后等待数据）→ 以当前握持角度自动校准，且 dir 归零：
+  // 校准瞬间绝不会触发移动
+  if (first || sensors.pendingCalibrate) {
     sensors.pendingCalibrate = false;
-    sensors.neutral = tilt * TILT_SIGN;
+    sensors.neutral = sensors.latest;
     sensors.calibrated = true;
     sensors.dir = 0;
   }
 }
 
-function calibrateTilt() {
-  sensors.calibratePressed = true;
+/* 以当前姿态自动校准（仅内部调用） */
+function autoCalibrate() {
   if (sensors.latest != null) {
-    sensors.neutral = sensors.latest;   // 当前握持姿态 = 中立角度
+    sensors.neutral = sensors.latest;
     sensors.calibrated = true;
     sensors.dir = 0;
   } else {
-    sensors.pendingCalibrate = true;
+    sensors.pendingCalibrate = true;   // 还没数据：等第一条读数到达再校准
   }
 }
 
-// CALIBRATE 按钮：iPhone（iOS 13+）通过按钮请求传感器授权；
-// 授权成功直接以当前姿态校准；被拒绝则 HUD 提示，不报错。
-function onCalibratePress() {
-  if (debugState.mode) {
-    // 诊断模式：验证按钮事件 + 尝试请求传感器权限（与联机无关）
-    setDebugMessage('CALIBRATE button OK');
-    if (needsSensorPermission()) {
-      setDebugMessage('CALIBRATE button OK · requesting sensor permission…');
-      DeviceOrientationEvent.requestPermission()
-        .then((state) => {
-          setDebugMessage('CALIBRATE button OK · permission: ' + state);
-          if (state === 'granted') calibrateTilt();
-        })
-        .catch((err) => {
-          setDebugMessage('CALIBRATE button OK · permission request failed: ' + (err && err.message ? err.message : err));
-        });
-    } else {
-      setDebugMessage('CALIBRATE button OK · no permission needed');
-      calibrateTilt();
-    }
-    return;
-  }
-
-  tryLockPortrait();
-
-  if (needsSensorPermission() && !sensors.permissionAsked) {
-    sensors.permissionAsked = true;
-    flashStatus('Tilt: Requesting sensor permission…');
+function requestMotionPermission() {
+  try {
     DeviceOrientationEvent.requestPermission()
       .then((state) => {
         if (state === 'granted') {
           sensors.denied = false;
-          calibrateTilt();
-          flashStatus('Tilt: Allowed · calibrated to current angle');
+          autoCalibrate();
+          flashStatus('Motion Access Allowed', 2000);
         } else {
           sensors.denied = true;
-          flashStatus('Tilt: Permission denied · use swipe/keys');
+          flashStatus('Motion Access Denied', 3000);
         }
       })
       .catch(() => {
         sensors.denied = true;
-        flashStatus('Tilt: Permission request failed · use swipe/keys');
+        flashStatus('Motion Access Denied', 3000);
       });
-  } else {
-    calibrateTilt();
-    flashStatus(sensors.calibrated ? 'Tilt: Calibrated · hold this angle' : 'Tilt: Waiting for sensor…');
+  } catch (err) {
+    sensors.permissionAsked = false;   // 异常：保留下次手势再试的机会
+  }
+}
+
+/* 在用户手势（JOIN / READY 点击）内调用：
+ * · 首次：自动请求授权（只自动请求一次，绝不反复弹出）；
+ * · 已被拒绝：用户主动点击 READY 即“重新授权入口”（iOS 若系统层面
+ *   已永久拒绝，重复调用会直接返回 denied，需用户在系统设置里开启）。 */
+function ensureMotionPermission() {
+  if (debugState.mode) return;
+  if (!needsSensorPermission()) return;   // Android/桌面：无需授权，直接监听
+  if (!sensors.permissionAsked) {
+    sensors.permissionAsked = true;
+    requestMotionPermission();
+  } else if (sensors.denied) {
+    requestMotionPermission();
   }
 }
 
 // 每帧调用：越过死区立即移动一格，之后按固定间隔连续移动；回到中立停止
 function updateTilt() {
+  if (isSpectator()) return;             // 观战者不能用倾斜移动
   if (!sensors.calibrated || sensors.latest == null) return;
   const d = sensors.latest - sensors.neutral;
   const dir = d > TILT_DEADZONE ? 1 : d < -TILT_DEADZONE ? -1 : 0;
@@ -991,24 +1344,36 @@ function drawBorder() {
   rect(0, 0, WORLD_W, WORLD_H);
 }
 
-/* 地面上的 Object（state = ground 才画）：金色礼物盒 + ID 标签 */
+/* 地面上的 Object（state = ground 才画）：Emoji + 轻微浮动动画
+ * Emoji 兼容性：p5 的 text() 走 canvas fillText，iPhone Safari 与
+ * Android Chrome 均自带彩色 Emoji 字体，可正常渲染。兜底：Emoji 缺失
+ * 或渲染异常时，深色圆底徽章仍清晰可见；反馈文案中也带 Object ID。 */
 function drawObjects() {
-  for (const o of OBJECTS) {
+  const objs = gameObjects();
+  for (const o of objs) {
     const st = window.shared.objects && window.shared.objects[o.id];
     if (!st || st.state !== 'ground') continue;   // 被携带 / 已交付的不画在地上
 
     const cx = o.x * CELL + CELL / 2;
     const cy = o.y * CELL + CELL / 2;
-    noStroke();
-    fill(255, 209, 102);
-    rect(cx - CELL * 0.26, cy - CELL * 0.2, CELL * 0.52, CELL * 0.4, 4);
-    fill(230, 170, 60);
-    rect(cx - CELL * 0.04, cy - CELL * 0.3, CELL * 0.08, CELL * 0.6);
-    fill(60, 45, 20);
-    textSize(10);
-    textAlign(CENTER, TOP);
-    text(o.id, cx, cy + CELL * 0.24);
+    // 轻微上下浮动 + 缩放，容易引起注意（相位按 id 错开）
+    const phase = (parseInt(String(o.id).slice(1), 10) || 1) * 1.7;
+    const floatY = Math.sin(millis() / 320 + phase) * CELL * 0.07;
+    const pulse = 1 + Math.sin(millis() / 420 + phase) * 0.05;
+    drawEmojiBadge(objectEmoji(o.id), cx, cy + floatY, CELL * 0.64 * pulse);
   }
+}
+
+/* Emoji 徽章：深色圆底 + Emoji。任何设备上圆底都保证物品位置清晰可见。 */
+function drawEmojiBadge(emoji, cx, cy, size) {
+  noStroke();
+  fill(20, 24, 34, 190);
+  circle(cx, cy, size);
+  const ch = (typeof emoji === 'string' && emoji.length > 0) ? emoji : '?';
+  textAlign(CENTER, CENTER);
+  textSize(size * 0.6);
+  fill(255);
+  text(ch, cx, cy + size * 0.02);
 }
 
 /* 各玩家基地标记（小旗）：自己 + 其他在线玩家 */
@@ -1047,52 +1412,58 @@ function colorOf(i) {
 }
 
 // 渲染自己（me）+ 所有在线玩家（guests，由 net.js 自动维护）
+// 全部使用视觉坐标（本机 gameState.render，guests 的 g.rx/g.ry）
 function drawPlayers() {
-  drawOnePlayer({ x: me.x, y: me.y, color: colorOf(me.color), obj: me.carryingObject || null }, true);
+  drawOnePlayer(
+    gameState.render.x, gameState.render.y,
+    colorOf(me.color), me.carryingObject, me.color, true
+  );
 
   const gs = window.guests || [];
   for (const g of gs) {
     // 新玩家还没完成颜色分配（color 仍为 -1）时不画，避免灰圈闪烁
     if (typeof g.color !== 'number' || g.color < 0) continue;
-    drawOnePlayer({ x: g.x, y: g.y, color: colorOf(g.color), obj: g.carryingObject || null }, false);
+    if (typeof g.rx !== 'number') { g.rx = (g.x + 0.5) * CELL; g.ry = (g.y + 0.5) * CELL; }
+    drawOnePlayer(g.rx, g.ry, colorOf(g.color), g.carryingObject, g.color, false);
   }
 }
 
-function drawOnePlayer(p, isSelf) {
-  const cx = p.x * CELL + CELL / 2;
-  const cy = p.y * CELL + CELL / 2;
-
+function drawOnePlayer(cx, cy, col, objId, colorIdx, isSelf) {
   // 影子
   noStroke();
   fill(0, 0, 0, 60);
   ellipse(cx, cy + CELL * 0.3, CELL * 0.72, CELL * 0.26);
 
   // 角色：彩色圆形（自己描边更醒目）
-  fill(p.color);
+  fill(col);
   stroke(255, 255, 255, isSelf ? 255 : 180);
   strokeWeight(isSelf ? 3 : 2);
   circle(cx, cy, CELL * 0.66);
+
+  // 编号徽章（30 人颜色相近时仍可区分，编号 = 颜色下标 + 1）
+  const num = String(((colorIdx % PALETTE.length) + PALETTE.length) % PALETTE.length + 1);
+  noStroke();
+  fill(255);
+  circle(cx + CELL * 0.22, cy - CELL * 0.22, 15);
+  fill(30, 30, 42);
+  textSize(9);
+  textAlign(CENTER, CENTER);
+  text(num, cx + CELL * 0.22, cy - CELL * 0.22 + 0.5);
 
   // 自己头顶的标记
   if (isSelf) {
     noStroke();
     fill(255);
-    textSize(12);
+    textSize(11);
     textAlign(CENTER, BOTTOM);
     text('YOU', cx, cy - CELL * 0.5);
   }
 
-  // 携带 Object：头顶金色标记（其他玩家同样可见，因为 obj 来自共享状态）
-  if (p.obj) {
-    const y0 = cy - (isSelf ? CELL * 0.78 : CELL * 0.62);
-    const s = isSelf ? 9 : 7;
-    noStroke();
-    fill(255, 209, 102);
-    quad(cx, y0 - s, cx + s, y0, cx, y0 + s, cx - s, y0);
-    fill(60, 45, 20);
-    textSize(isSelf ? 10 : 9);
-    textAlign(CENTER, CENTER);
-    text(p.obj, cx, y0);
+  // 携带 Object：头顶显示对应 Emoji（其他玩家同样可见，objId 来自共享状态）
+  if (objId) {
+    const y0 = cy - (isSelf ? CELL * 0.85 : CELL * 0.68);
+    const s = isSelf ? CELL * 0.42 : CELL * 0.36;
+    drawEmojiBadge(objectEmoji(objId), cx, y0, s);
   }
 }
 
@@ -1131,39 +1502,119 @@ function drawBaseArrow() {
   pop();
 }
 
-// HUD：坐标 + 倾斜 + 联机 + 占地/交付 + 时间（开发测试用，无全局排名）
+// HUD：顶栏（游戏名 / 在线人数 / 时间 + 网络状态点）+ 两行精简信息。
+// 不显示 X/Y 等冗余文字，尽量少遮挡游戏画面。
 function drawHUD() {
-  let line4 = 'Territory ' + myCellCount() + ' · Delivered ' + (typeof me.delivered === 'number' ? me.delivered : 0);
-  if (me.carryingObject) line4 += ' · Carrying ' + me.carryingObject;
-  const lines = [
-    'X ' + me.x + ' · Y ' + me.y,
-    sensorStatusText(),
-    connectionText(),
-    line4,
-    gameStatusText()
-  ];
+  const p = gamePhase();
+  const online = onlineCount();
+  const playersText = online === 1 ? '1 Player' : online + ' Players';
 
-  textSize(14);
-  textAlign(LEFT, TOP);
-  let w = 0;
-  for (const l of lines) w = Math.max(w, textWidth(l));
-  w += 20;
-
+  // 顶栏背景
   noStroke();
   fill(0, 0, 0, 0.45);
-  rect(8, 8, w, lines.length * 16 + 16, 8);
+  rect(0, 0, width, 46, 0, 0, 10, 10);
+
+  // 左：游戏名
+  textAlign(LEFT, CENTER);
+  textSize(14);
   fill(255);
-  for (let i = 0; i < lines.length; i++) {
-    text(lines[i], 18, 14 + i * 16);
+  text('Territory Heist', 12, 14);
+
+  // 中：在线人数；等待阶段附 Ready: n/m
+  textAlign(CENTER, CENTER);
+  fill(255, 225, 140);
+  textSize(14);
+  text(playersText, width / 2, 14);
+  if (p === 'lobby') {
+    textSize(11);
+    fill(190, 225, 255);
+    text('Ready: ' + readyCount() + '/' + online, width / 2, 32);
+  } else if (isSpectator()) {
+    textSize(11);
+    fill(255, 190, 130);
+    text('Spectator', width / 2, 32);
   }
+
+  // 右：时间
+  textAlign(RIGHT, CENTER);
+  textSize(14);
+  fill(255);
+  text(timeText(), width - 42, 14);
+
+  // 网络状态小圆点（绿=已连接 / 黄=连接中 / 红=失败 / 灰=未加入）
+  const dot = netDotColor();
+  noStroke();
+  fill(dot[0], dot[1], dot[2]);
+  circle(width - 16, 22, 10);
+
+  // 第二行：玩家状态（领地 / 交付 / 携带）
+  textAlign(LEFT, TOP);
+  textSize(12);
+  fill(230, 230, 240);
+  let info = 'Territory ' + myCellCount() + ' · Delivered ' + (typeof me.delivered === 'number' ? me.delivered : 0);
+  if (me.carryingObject) info += ' · Carrying ' + objectEmoji(me.carryingObject);
+  if (isSpectator()) info = 'Spectator · watching this round';
+  text(info, 12, 52);
+
+  // 第三行：倾斜状态（诊断模式不显示）
+  if (!debugState.mode) {
+    textSize(11);
+    fill(205, 205, 220);
+    text(sensorStatusText(), 12, 68);
+  }
+}
+
+function timeText() {
+  const p = gamePhase();
+  if (p === 'running') {
+    const s = Math.max(0, Math.ceil(remainingMs() / 1000));
+    const mm = String(Math.floor(s / 60)).padStart(2, '0');
+    const ss = String(s % 60).padStart(2, '0');
+    return mm + ':' + ss;
+  }
+  if (p === 'countdown') return 'Starting…';
+  if (p === 'ended') return "Time's Up";
+  return 'Waiting';
+}
+
+function netDotColor() {
+  if (debugState.mode) return [150, 155, 170];
+  if (!isShareConfigured()) return [150, 155, 170];
+  const st = window.shareStatus;
+  if (st === 'connected') return [126, 231, 135];
+  if (st === 'connecting') return [240, 198, 116];
+  if (st === 'error' || st === 'unsupported') return [255, 123, 114];
+  return [150, 155, 170];
+}
+
+/* 开赛倒计时：countdown 阶段显示 3 / 2 / 1，刚进入 running 显示 GO! */
+function drawCountdown() {
+  const p = gamePhase();
+  if (p === 'countdown') {
+    const g = window.shared.game;
+    const readyAt = (typeof g.readyAt === 'number') ? g.readyAt : Date.now();
+    const remain = READY_COUNTDOWN_MS - (Date.now() - readyAt);
+    if (remain <= 0) return;
+    const n = Math.min(3, Math.max(1, Math.ceil(remain / 1000)));
+    bigCenterText(String(n));
+  } else if (p === 'running' && Date.now() < game.goFlashUntil) {
+    bigCenterText('GO!');
+  }
+}
+
+function bigCenterText(str) {
+  noStroke();
+  fill(0, 0, 0, 150);
+  rect(0, height * 0.28, width, height * 0.22);
+  textAlign(CENTER, CENTER);
+  textSize(100);
+  fill(255, 225, 140);
+  text(str, width / 2, height * 0.4);
 }
 
 function sensorStatusText() {
   if (sensors.denied) {
-    return 'Tilt: Permission denied · use swipe/keys';
-  }
-  if (sensors.needPermission && !sensors.permissionAsked) {
-    return 'Tilt: Tap CALIBRATE to allow';
+    return 'Motion Access Denied';
   }
   if (sensors.calibrated) {
     if (sensors.latest == null) return 'Tilt: Calibrated';
@@ -1171,10 +1622,7 @@ function sensorStatusText() {
     const arrow = d > TILT_DEADZONE ? '→' : d < -TILT_DEADZONE ? '←' : '·';
     return 'Tilt: ' + arrow + ' ' + Math.round(d) + '°';
   }
-  if (sensors.calibratePressed && !sensors.available) {
-    return 'Tilt: No sensor · use swipe/keys';
-  }
-  return 'Tilt: Tap CALIBRATE to calibrate';
+  return 'Tilt: waiting for sensor…';
 }
 
 function connectionText() {
@@ -1182,7 +1630,7 @@ function connectionText() {
   if (!isShareConfigured()) return 'Net: No room configured';
   if (typeof netConnect !== 'function') return 'Net: Multiplayer lib failed · single player · refresh to retry';
   const st = window.shareStatus;
-  if (st === 'connected') return 'Net: Connected · ' + onlineCount() + '/' + MAX_PLAYERS + ' players';
+  if (st === 'connected') return 'Net: Connected';
   if (st === 'connecting') return 'Net: Connecting…';
   if (st === 'error') return 'Net: Connection Failed · ' + (window.shareError || 'check network/server');
   if (st === 'unsupported') return 'Net: Connection Failed · WebSocket not supported';
@@ -1252,41 +1700,54 @@ function updateJoinButton() {
   else { btn.disabled = false; btn.textContent = 'JOIN'; }
 }
 
-/* START / PLAY AGAIN 按钮状态跟随游戏阶段变化 */
-let lastStartBtnState = null;
-function updateStartButton() {
-  const btn = document.getElementById('btn-start');
+/* READY / PLAY AGAIN 按钮状态跟随连接与比赛阶段变化 */
+let lastReadyBtnState = null;
+function updateReadyButton() {
+  const btn = document.getElementById('btn-ready');
   if (!btn) return;
   const online = !isShareConfigured() || isConnected();
-  const state = !online ? 'noconn' : gamePhase();
-  if (state === lastStartBtnState) return;
-  lastStartBtnState = state;
+  let state;
+  if (!online) state = 'noconn';
+  else if (gamePhase() === 'ended') state = 'ended';
+  else if (gamePhase() === 'running') state = isSpectator() ? 'spectator' : 'running';
+  else state = me.ready ? 'unready' : 'ready';
+  if (state === lastReadyBtnState) return;
+  lastReadyBtnState = state;
   if (state === 'noconn') { btn.disabled = true; btn.textContent = 'Not Connected'; }
   else if (state === 'running') { btn.disabled = true; btn.textContent = 'Running…'; }
+  else if (state === 'spectator') { btn.disabled = true; btn.textContent = 'Spectator'; }
   else if (state === 'ended') { btn.disabled = false; btn.textContent = 'PLAY AGAIN'; }
-  else { btn.disabled = false; btn.textContent = 'START'; }
+  else if (state === 'unready') { btn.disabled = false; btn.textContent = 'READY ✓'; }
+  else { btn.disabled = false; btn.textContent = 'READY'; }
 }
 
-/* START（lobby → running）/ PLAY AGAIN（ended → 新 lobby + 清空地图与物品） */
-function bindStart() {
-  const btn = document.getElementById('btn-start');
+/* READY：切换准备状态（me.ready 随 pstate 自动广播）；
+ * countdown 期间取消准备会自动取消倒计时（updateReadyFlow 处理）；
+ * PLAY AGAIN：写 lobby + 新局号并清空地图与物品（各设备自行重置 me）。 */
+function bindReady() {
+  const btn = document.getElementById('btn-ready');
   if (!btn) return;
   btn.addEventListener('click', () => {
+    ensureMotionPermission();   // 用户手势内请求传感器授权（iOS）
+    tryLockPortrait();
+
     const p = gamePhase();
-    if (p === 'running') return;
-    const round = gameRound();
-    if (p === 'lobby') {
-      // 任一玩家启动：沿用当前局号，写 running + 启动者时钟
-      window.shared.game = { phase: 'running', round: round, startAt: Date.now() };
-      flashStatus('Game Started!');
-    } else {
-      // PLAY AGAIN：写 lobby + 新局号，并清空地图与物品（各设备自行重置 me）
-      window.shared.game = { phase: 'lobby', round: round + 1 };
+    if (p === 'ended') {
+      // PLAY AGAIN：新局号 + 清场（Object 布局在开赛时按新人数生成）
+      const round = gameRound();
+      window.shared.game = { phase: 'lobby', round: round + 1, participants: [] };
       window.shared.cells = {};
       window.shared.objects = {};
-      for (const o of OBJECTS) window.shared.objects[o.id] = { state: 'ground' };
       flashStatus('New Round · Waiting for Players!');
+      return;
     }
+    if (p === 'running') return;
+    if (isSpectator()) return;
+    if (isShareConfigured() && !isConnected()) return;
+
+    // lobby / countdown：切换准备状态
+    me.ready = !me.ready;
+    flashStatus(me.ready ? 'Ready!' : 'Not Ready', 1200);
   });
 }
 
@@ -1352,6 +1813,7 @@ function bindJoin() {
       flashStatus('Net: Multiplayer lib missing · single player');
       return;
     }
+    ensureMotionPermission();   // 用户手势内请求传感器授权（iOS）
     // 点击立即反馈：Connecting…（Connected / Connection Failed 由 net.js 状态驱动显示）
     btn.disabled = true;
     btn.textContent = 'Connecting…';
@@ -1375,10 +1837,7 @@ function bindInput() {
   bindTwoFingerTap(canvasEl);   // 双指点击 = 抢夺（不触发 Swipe/缩放）
   bindKeyboard();
   bindJoin();
-  bindStart();
-
-  const calBtn = document.getElementById('btn-calibrate');
-  if (calBtn) calBtn.addEventListener('click', onCalibratePress);
+  bindReady();
 
   window.addEventListener('deviceorientation', onDeviceOrientation);
 
@@ -1394,8 +1853,9 @@ function bindInput() {
  *      联机模式调 netInit 建立 SharedRoom 状态，失败自动降级为单机，
  *      绝不带着未初始化的状态跑游戏）；
  *   2) 画布（失败 = 致命错误，状态行持续显示具体原因）；
- *   3) 输入绑定（此后 JOIN/CALIBRATE/START/方向键始终有效）；
- *   4) 摄像机；
+ *   3) 输入绑定（此后 JOIN/READY/方向键始终有效；倾斜授权在 JOIN/READY
+ *      的用户手势内自动完成）；
+ *   4) 摄像机（以视觉坐标落位）；
  *   5) 初始化成功提示。任何一段出错都会把具体原因显示在底部状态行。
  * 另：setup() 首行设置 window.__gameStarted，供 index.html 加载器
  * 判断“游戏已启动”，防止重复创建 p5 实例。
@@ -1417,13 +1877,14 @@ function initLocalState() {
     x: 12, y: 12, color: 0,            // 单机直接分配颜色 0（珊瑚红）与出生点
     baseX: 12, baseY: 12,
     carryingObject: null,
-    delivered: 0
+    delivered: 0,
+    ready: false
   };
   if (!Array.isArray(window.guests)) window.guests = [];
   window.shared = {
     cells: {},                          // 占地地图
     objects: {},                        // Object 条目由 draw() 的 healObjects() 补齐
-    game: { phase: 'lobby', round: 0 }  // 赛制：lobby / running / ended
+    game: { phase: 'lobby', round: 0 }  // 赛制：lobby / countdown / running / ended
   };
 }
 
@@ -1450,18 +1911,14 @@ function setup() {
           room: SHARE_CONFIG.room,      // ?room= URL 参数优先于这里（见 net.js）
           shared: {
             cells: {},                  // 占地地图：cells["x,y"] = { o: 玩家ID, c: 颜色下标 }
-            objects: {                  // 4 个公共 Object（新房间的初始状态）
-              o1: { state: 'ground' },
-              o2: { state: 'ground' },
-              o3: { state: 'ground' },
-              o4: { state: 'ground' }
-            },
-            game: { phase: 'lobby', round: 0 }   // 赛制：lobby / running / ended
+            objects: {},                // Object 条目按本局布局自愈（见 healObjects）
+            game: { phase: 'lobby', round: 0 }   // 赛制：lobby / countdown / running / ended
           },
           me: {
             x: 12, y: 12, color: -1,    // color -1 = 未分配，连接后自动分配
             carryingObject: null,       // 携带的 Object ID（null = 空手）
-            delivered: 0                // 已交付数量（自己）
+            delivered: 0,               // 已交付数量（自己）
+            ready: false                // 加入房间默认 Not Ready
           }
         });
         // 防御：联机层已加载但未按预期创建全局状态 → 降级为单机，保证画面正常显示
@@ -1505,9 +1962,11 @@ function setup() {
 
   sensors.needPermission = needsSensorPermission();
 
-  // ── 4) 摄像机 ──
+  // ── 4) 摄像机（以视觉坐标落位，避免开局跨图滑行） ──
   try {
-    const t = clampCam(camTarget(me).x, camTarget(me).y);
+    gameState.render.x = (me.x + 0.5) * CELL;
+    gameState.render.y = (me.y + 0.5) * CELL;
+    const t = clampCam(camTarget().x, camTarget().y);
     gameState.camera.x = t.x;
     gameState.camera.y = t.y;
   } catch (err) {
@@ -1526,16 +1985,19 @@ function setup() {
 function draw() {
   background('#181b26');   // 地图外区域的颜色
 
+  const dt = frameDelta(); // 帧间隔（秒），平滑动画基于 deltaTime
+  updateRender(dt);        // 本机角色 + guests 的视觉坐标平滑追赶
   updateTilt();
-  healObjects();            // 补齐缺失的 Object 条目
-  updateGameFlow();         // 局号推进 / 倒计时 / 结束 / 计分
+  healObjects();            // 按本局布局补齐/清理 Object 条目
+  updateGameFlow();         // 局号推进 / 倒计时锁定 / 结束 / 计分
+  updateReadyFlow();        // READY 仲裁：全员就绪 → countdown → running
   ensureMyColor();          // 连接后：分配颜色/出生点/基地、解决颜色冲突
   resolveObjectConflicts(); // 裁决回滚：抢拾/被抢的输家自动放下
   assertDelivered();        // 守护已交付的 Object 不被迟到宣告复活
   updateJoinButton();
-  updateStartButton();
+  updateReadyButton();
   updateNetStatus();        // 底部状态行：连接状态/失败提示
-  updateCamera();
+  updateCamera(dt);
 
   push();
   translate(-gameState.camera.x, -gameState.camera.y); // 摄像机跟随
@@ -1547,6 +2009,7 @@ function draw() {
   pop();
 
   drawBaseArrow();          // 屏幕边缘指向自己基地的箭头
+  drawCountdown();          // 3 / 2 / 1 / GO!
   drawHUD();
   drawStealFeedback();      // 抢夺成功/失败/冷却/距离提示
   drawResults();            // 结束后：完整领地地图 + 排名 + 得分明细
