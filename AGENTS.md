@@ -7,7 +7,10 @@
 - 本文件（AGENTS.md）的修改同样要提交并推送。
 
 ## 长期约束
+- 项目沿用 DECIDER 名称（页面标题与所有玩家可见界面文案使用 DECIDER / 英文）。
+- 所有玩家可见界面文字使用英文（代码内部注释可用中文）。
 - 不修改现有游戏玩法（规则/UI/操作/倾斜/摄像机/计分保持一致）。
+- 手机端无方向按钮：滑动（上下）、倾斜（左右）、双指点击（抢夺）、CALIBRATE；桌面保留 WASD/方向键调试。
 - 联机架构 = SharedRoom（MQTT）：js/vendor/mqtt.min.js + js/net.js，
   broker 为 wss://broker.emqx.io:8084/mqtt 与 wss://broker.hivemq.com:8884/mqtt
   （复用 DECIDER Phase2 旧项目 my-project-phase-2 的方案）。不要改回 p5-phone，不要更换服务器地址。

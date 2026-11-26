@@ -1,10 +1,10 @@
 # Phase2Playtest_Version2
 
-A redesigned multiplayer game based on DECIDER, featuring territory control and object stealing.
+A redesigned multiplayer game based on DECIDER, featuring territory control and object stealing. All player-facing UI is in English.
 
-## Current Prototype — 格子漫游 (Grid Walker)
+## Current Prototype — DECIDER (Grid Walker)
 
-原型阶段：验证地图、摄像机、手机操作与多人同步。
+原型阶段：验证地图、摄像机、手机操作与多人同步（界面全英文）。
 
 - `index.html` / `style.css` / `sketch.js` / `js/net.js` / `js/vendor/mqtt.min.js`（HTML + CSS + JavaScript + p5.js + MQTT.js，无其他框架）
 - 24×24 二维格子地图，Camera Follow 只跟随自己的角色，边缘正确钳制
@@ -16,7 +16,7 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 |---|---|
 | Swipe | 画面上滑/下滑，每次移动一格 |
 | Tilt | 左右倾斜横向移动（5° 死区 + 220ms 定间隔），CALIBRATE 以当前姿态校准中立角 |
-| 方向按钮 | 备用操作（不支持倾斜的设备也能玩） |
+| Two-Finger Tap | 双指同时点击画面：抢夺相邻玩家携带的 Object（1.5s 冷却） |
 | JOIN | 加入共享房间（多人同步） |
 | 键盘（桌面调试） | WASD / 方向键 |
 

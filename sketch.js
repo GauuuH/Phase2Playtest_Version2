@@ -102,8 +102,8 @@
  * ── 操作方式（手机） ──
  *   · Swipe：画面上滑/下滑，每次移动一格
  *   · Tilt ：左右倾斜横向移动（死区 + 定间隔），CALIBRATE 校准中立角
- *   · 方向按钮：备用操作
- *   · JOIN：加入共享房间（iPhone 等也通过它完成必要的手势）
+ *   · Two-Finger Tap：抢夺其他玩家携带的 Object
+ *   · JOIN：加入共享房间
  * ── 操作方式（桌面调试） ──
  *   · 方向键 / WASD
  * ============================================================ */
@@ -114,7 +114,7 @@
 window.addEventListener('error', (e) => {
   try {
     const el = document.getElementById('net-status');
-    if (el) el.textContent = 'JS 错误: ' + (e.message || '未知错误');
+    if (el) el.textContent = 'JS Error: ' + (e.message || 'unknown error');
   } catch (x) { /* 忽略 */ }
 });
 
@@ -395,9 +395,9 @@ function computeScores() {
 // HUD 用：阶段 / 倒计时
 function gameStatusText() {
   const p = gamePhase();
-  if (p === 'running') return '时间: ' + Math.ceil(remainingMs() / 1000) + 's';
-  if (p === 'ended') return '时间: 已结束';
-  return '时间: 等待开始';
+  if (p === 'running') return 'Time: ' + Math.ceil(remainingMs() / 1000) + 's';
+  if (p === 'ended') return "Time's Up";
+  return 'Waiting for Players';
 }
 
 /* ============================================================
@@ -493,6 +493,7 @@ function tryPickup(x, y) {
   const st = window.shared.objects && window.shared.objects[obj.id];
   if (!st || st.state !== 'ground') return;   // 已被人拿走 / 已交付
   claimObject(obj.id);
+  setStealFeedback('Object Collected · ' + obj.id, FEEDBACK_OK);
 }
 
 /* 拾取宣告（同时是未来双指抢夺的转移入口，本阶段不接线）：
@@ -523,6 +524,7 @@ function tryDeliver(x, y) {
   me.carryingObject = null;                     // 清空 → 恢复占地能力
   me.delivered = (typeof me.delivered === 'number' ? me.delivered : 0) + 1;
   steal.deliveredByMe.add(objId);               // 守护：防止被迟到的抢夺宣告复活
+  setStealFeedback('Object Delivered! +30', FEEDBACK_OK);
 }
 
 // 每帧调用：裁决回滚 —— 若我携带的 Object 的 by 已不是我（服务器判定别人
@@ -538,7 +540,7 @@ function resolveObjectConflicts() {
   if (st.state === 'carried' && st.by !== myOwnerId()) {
     const lost = me.carryingObject;
     me.carryingObject = null;   // 被抢 / 抢拾输了 → 放下，恢复占地能力
-    setStealFeedback('失去 ' + lost + '!', FEEDBACK_FAIL);
+    setStealFeedback('Lost ' + lost + '!', FEEDBACK_FAIL);
   }
 }
 
@@ -590,40 +592,40 @@ function nearestCarrier() {
 function trySteal() {
   const now = millis();
   if (now < steal.cooldownUntil) {
-    setStealFeedback('冷却中…', FEEDBACK_COOL);
+    setStealFeedback('Cooldown…', FEEDBACK_COOL);
     return;
   }
   steal.cooldownUntil = now + STEAL_COOLDOWN;   // 每次尝试都进入冷却
 
   if (isShareConfigured() && !isConnected()) {
-    setStealFeedback('未连接房间', FEEDBACK_FAIL);
+    setStealFeedback('Not Connected', FEEDBACK_FAIL);
     return;
   }
   if (!gameIsRunning()) {
-    setStealFeedback('比赛未进行', FEEDBACK_FAIL);
+    setStealFeedback('Game not started', FEEDBACK_FAIL);
     return;
   }
   if (me.carryingObject) {
-    setStealFeedback('必须空手才能抢夺', FEEDBACK_FAIL);
+    setStealFeedback('Hands Full', FEEDBACK_FAIL);
     return;
   }
   const t = nearestCarrier();
   if (!t) {
-    setStealFeedback('周围无人携带 Object', FEEDBACK_FAIL);
+    setStealFeedback('No carrier nearby', FEEDBACK_FAIL);
     return;
   }
   if (t.d > 1) {
-    setStealFeedback('距离不足 · 需相邻 1 格', FEEDBACK_FAIL);
+    setStealFeedback('Too Far · need adjacent tile', FEEDBACK_FAIL);
     return;
   }
   const objId = t.g.carryingObject;
   const st = window.shared.objects && window.shared.objects[objId];
   if (!st || st.state !== 'carried') {
-    setStealFeedback('Object 已不在对方手上', FEEDBACK_FAIL);   // 已被交付/转移
+    setStealFeedback('Object no longer carried', FEEDBACK_FAIL);   // 已被交付/转移
     return;
   }
   claimObject(objId);   // 所有权转移：原携带者会自动放下
-  setStealFeedback('抢到 ' + objId + '!', FEEDBACK_OK);
+  setStealFeedback('Object Stolen · ' + objId + '!', FEEDBACK_OK);
 }
 
 // 每帧调用：守护“已交付”状态 —— 若我交付过的 Object 被迟到的抢夺宣告
@@ -696,7 +698,7 @@ function drawResults() {
   let ty = my + mapSize + 18;
   textSize(17);
   fill(255, 209, 102);
-  text('游戏结束 · 排名', 16, ty);
+  text('Final Results', 16, ty);
   ty += 30;
   for (let i = 0; i < sc.length; i++) {
     const p = sc[i];
@@ -707,10 +709,10 @@ function drawResults() {
     circle(24, ty + 6, 10);
     fill(255);
     textSize(13);
-    text((i + 1) + '. ' + (isMe ? '我' : 'P' + (p.color + 1)) + '  ' + p.total + ' 分', 40, ty);
+    text((i + 1) + '. ' + (isMe ? 'YOU' : 'P' + (p.color + 1)) + '  ' + p.total + ' pts', 40, ty);
     fill(205, 205, 215);
     textSize(11);
-    text('领地 ' + p.cells + ' + 交付 ' + p.delivered + '×30 + 携带 ' + p.carried + '×15', 40, ty + 17);
+    text('Territory ' + p.cells + ' + Delivered ' + p.delivered + '×30 + Carried ' + p.carried + '×15', 40, ty + 17);
     ty += 38;
   }
 }
@@ -851,19 +853,19 @@ function calibrateTilt() {
 function onCalibratePress() {
   if (debugState.mode) {
     // 诊断模式：验证按钮事件 + 尝试请求传感器权限（与联机无关）
-    setDebugMessage('CALIBRATE 按钮正常');
+    setDebugMessage('CALIBRATE button OK');
     if (needsSensorPermission()) {
-      setDebugMessage('CALIBRATE 按钮正常 · 请求传感器权限…');
+      setDebugMessage('CALIBRATE button OK · requesting sensor permission…');
       DeviceOrientationEvent.requestPermission()
         .then((state) => {
-          setDebugMessage('CALIBRATE 按钮正常 · 传感器权限: ' + state);
+          setDebugMessage('CALIBRATE button OK · permission: ' + state);
           if (state === 'granted') calibrateTilt();
         })
         .catch((err) => {
-          setDebugMessage('CALIBRATE 按钮正常 · 权限请求失败: ' + (err && err.message ? err.message : err));
+          setDebugMessage('CALIBRATE button OK · permission request failed: ' + (err && err.message ? err.message : err));
         });
     } else {
-      setDebugMessage('CALIBRATE 按钮正常 · 无需授权(Android/桌面)');
+      setDebugMessage('CALIBRATE button OK · no permission needed');
       calibrateTilt();
     }
     return;
@@ -873,25 +875,25 @@ function onCalibratePress() {
 
   if (needsSensorPermission() && !sensors.permissionAsked) {
     sensors.permissionAsked = true;
-    flashStatus('倾斜: 正在请求传感器权限…');
+    flashStatus('Tilt: Requesting sensor permission…');
     DeviceOrientationEvent.requestPermission()
       .then((state) => {
         if (state === 'granted') {
           sensors.denied = false;
           calibrateTilt();
-          flashStatus('倾斜: 已授权 · 已按当前角度校准');
+          flashStatus('Tilt: Allowed · calibrated to current angle');
         } else {
           sensors.denied = true;
-          flashStatus('倾斜: 权限被拒 · 用按钮/滑动');
+          flashStatus('Tilt: Permission denied · use swipe/keys');
         }
       })
       .catch(() => {
         sensors.denied = true;
-        flashStatus('倾斜: 权限请求失败 · 用按钮/滑动');
+        flashStatus('Tilt: Permission request failed · use swipe/keys');
       });
   } else {
     calibrateTilt();
-    flashStatus(sensors.calibrated ? '倾斜: 已校准 · 保持当前握持角度' : '倾斜: 等待传感器数据…');
+    flashStatus(sensors.calibrated ? 'Tilt: Calibrated · hold this angle' : 'Tilt: Waiting for sensor…');
   }
 }
 
@@ -1036,7 +1038,7 @@ function drawBaseMarker(x, y, col, isSelf) {
     fill(255);
     textSize(10);
     textAlign(CENTER, TOP);
-    text('基地', cx + CELL * 0.16, cy - CELL * 0.5);
+    text('BASE', cx + CELL * 0.16, cy - CELL * 0.5);
   }
 }
 
@@ -1077,7 +1079,7 @@ function drawOnePlayer(p, isSelf) {
     fill(255);
     textSize(12);
     textAlign(CENTER, BOTTOM);
-    text('你', cx, cy - CELL * 0.5);
+    text('YOU', cx, cy - CELL * 0.5);
   }
 
   // 携带 Object：头顶金色标记（其他玩家同样可见，因为 obj 来自共享状态）
@@ -1131,8 +1133,8 @@ function drawBaseArrow() {
 
 // HUD：坐标 + 倾斜 + 联机 + 占地/交付 + 时间（开发测试用，无全局排名）
 function drawHUD() {
-  let line4 = '占地 ' + myCellCount() + ' · 交付 ' + (typeof me.delivered === 'number' ? me.delivered : 0);
-  if (me.carryingObject) line4 += ' · 携带 ' + me.carryingObject;
+  let line4 = 'Territory ' + myCellCount() + ' · Delivered ' + (typeof me.delivered === 'number' ? me.delivered : 0);
+  if (me.carryingObject) line4 += ' · Carrying ' + me.carryingObject;
   const lines = [
     'X ' + me.x + ' · Y ' + me.y,
     sensorStatusText(),
@@ -1158,33 +1160,33 @@ function drawHUD() {
 
 function sensorStatusText() {
   if (sensors.denied) {
-    return '倾斜: 权限被拒 · 用按钮/滑动';
+    return 'Tilt: Permission denied · use swipe/keys';
   }
   if (sensors.needPermission && !sensors.permissionAsked) {
-    return '倾斜: 点 CALIBRATE 授权';
+    return 'Tilt: Tap CALIBRATE to allow';
   }
   if (sensors.calibrated) {
-    if (sensors.latest == null) return '倾斜: 已校准';
+    if (sensors.latest == null) return 'Tilt: Calibrated';
     const d = sensors.latest - sensors.neutral;
     const arrow = d > TILT_DEADZONE ? '→' : d < -TILT_DEADZONE ? '←' : '·';
-    return '倾斜: ' + arrow + ' ' + Math.round(d) + '°';
+    return 'Tilt: ' + arrow + ' ' + Math.round(d) + '°';
   }
   if (sensors.calibratePressed && !sensors.available) {
-    return '倾斜: 无传感器 · 用按钮/滑动';
+    return 'Tilt: No sensor · use swipe/keys';
   }
-  return '倾斜: 点 CALIBRATE 校准';
+  return 'Tilt: Tap CALIBRATE to calibrate';
 }
 
 function connectionText() {
-  if (debugState.mode) return '联机: 诊断模式 · 不访问服务器';
-  if (!isShareConfigured()) return '联机: 未配置房间';
-  if (typeof netConnect !== 'function') return '联机: 联机库加载失败 · 单机画面可用 · 请刷新重试';
+  if (debugState.mode) return 'Net: Diagnostic mode · offline';
+  if (!isShareConfigured()) return 'Net: No room configured';
+  if (typeof netConnect !== 'function') return 'Net: Multiplayer lib failed · single player · refresh to retry';
   const st = window.shareStatus;
-  if (st === 'connected') return '联机: Connected · 在线 ' + onlineCount() + '/' + MAX_PLAYERS;
-  if (st === 'connecting') return '联机: Connecting…';
-  if (st === 'error') return '联机: Connection Failed · ' + (window.shareError || '请检查网络/服务器');
-  if (st === 'unsupported') return '联机: Connection Failed · 浏览器不支持 WebSocket';
-  return '联机: 点 JOIN 加入房间';
+  if (st === 'connected') return 'Net: Connected · ' + onlineCount() + '/' + MAX_PLAYERS + ' players';
+  if (st === 'connecting') return 'Net: Connecting…';
+  if (st === 'error') return 'Net: Connection Failed · ' + (window.shareError || 'check network/server');
+  if (st === 'unsupported') return 'Net: Connection Failed · WebSocket not supported';
+  return 'Net: Tap JOIN to enter the room';
 }
 
 /* 页面底部状态行（DOM）：JOIN 反馈与失败提示不依赖画布渲染 */
@@ -1194,9 +1196,9 @@ function setNetStatus(text) {
 }
 
 function netStatusText() {
-  if (fatalInitError) return '初始化失败: ' + fatalInitError;
+  if (fatalInitError) return 'Init failed: ' + fatalInitError;
   if (debugState.mode) {
-    return '诊断模式 · 帧 ' + frameCount + (debugState.message ? ' · ' + debugState.message : '');
+    return 'Diagnostic · frame ' + frameCount + (debugState.message ? ' · ' + debugState.message : '');
   }
   if (statusFlash && Date.now() < statusFlash.until) return statusFlash.text;
   return connectionText();
@@ -1242,11 +1244,11 @@ function updateJoinButton() {
   if (state === lastJoinBtnState) return;
   lastJoinBtnState = state;
   if (state === 'debugjoin') { btn.disabled = false; btn.textContent = 'JOIN'; }
-  else if (state === 'noconfig') { btn.disabled = true; btn.textContent = '无房间'; }
-  else if (state === 'nolib') { btn.disabled = true; btn.textContent = '库加载失败'; }
+  else if (state === 'noconfig') { btn.disabled = true; btn.textContent = 'No Room'; }
+  else if (state === 'nolib') { btn.disabled = true; btn.textContent = 'No Net Lib'; }
   else if (state === 'joined') { btn.disabled = true; btn.textContent = 'Connected ✓'; }
   else if (state === 'connecting') { btn.disabled = true; btn.textContent = 'Connecting…'; }
-  else if (state === 'error') { btn.disabled = false; btn.textContent = '重试 JOIN'; }
+  else if (state === 'error') { btn.disabled = false; btn.textContent = 'Retry JOIN'; }
   else { btn.disabled = false; btn.textContent = 'JOIN'; }
 }
 
@@ -1259,8 +1261,8 @@ function updateStartButton() {
   const state = !online ? 'noconn' : gamePhase();
   if (state === lastStartBtnState) return;
   lastStartBtnState = state;
-  if (state === 'noconn') { btn.disabled = true; btn.textContent = '未连接'; }
-  else if (state === 'running') { btn.disabled = true; btn.textContent = '进行中…'; }
+  if (state === 'noconn') { btn.disabled = true; btn.textContent = 'Not Connected'; }
+  else if (state === 'running') { btn.disabled = true; btn.textContent = 'Running…'; }
   else if (state === 'ended') { btn.disabled = false; btn.textContent = 'PLAY AGAIN'; }
   else { btn.disabled = false; btn.textContent = 'START'; }
 }
@@ -1276,12 +1278,14 @@ function bindStart() {
     if (p === 'lobby') {
       // 任一玩家启动：沿用当前局号，写 running + 启动者时钟
       window.shared.game = { phase: 'running', round: round, startAt: Date.now() };
+      flashStatus('Game Started!');
     } else {
       // PLAY AGAIN：写 lobby + 新局号，并清空地图与物品（各设备自行重置 me）
       window.shared.game = { phase: 'lobby', round: round + 1 };
       window.shared.cells = {};
       window.shared.objects = {};
       for (const o of OBJECTS) window.shared.objects[o.id] = { state: 'ground' };
+      flashStatus('New Round · Waiting for Players!');
     }
   });
 }
@@ -1316,28 +1320,7 @@ function bindSwipe(canvasEl) {
   canvasEl.addEventListener('pointercancel', () => { start = null; });
 }
 
-// 备用方向按钮：每按一次移动一格
-function bindDpad() {
-  const dirs = {
-    'btn-up':    { dx: 0, dy: -1 },
-    'btn-down':  { dx: 0, dy: 1 },
-    'btn-left':  { dx: -1, dy: 0 },
-    'btn-right': { dx: 1, dy: 0 }
-  };
-
-  for (const id in dirs) {
-    const btn = document.getElementById(id);
-    if (!btn) continue;
-    const dir = dirs[id];
-    btn.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      moveMe(dir.dx, dir.dy);
-    });
-    btn.addEventListener('contextmenu', (e) => e.preventDefault());
-  }
-}
-
-// 桌面调试：方向键 / WASD
+// 桌面调试：方向键 / WASD（手机端没有方向按钮，用滑动 / 倾斜）
 function bindKeyboard() {
   window.addEventListener('keydown', (e) => {
     const keyMap = {
@@ -1361,12 +1344,12 @@ function bindJoin() {
   btn.addEventListener('click', () => {
     if (debugState.mode) {
       // 诊断模式：不调用 netConnect、不访问 broker，只验证按钮与事件
-      setDebugMessage('JOIN 按钮正常');
+      setDebugMessage('JOIN button OK');
       return;
     }
     if (!isShareConfigured() || isConnected()) return;
     if (typeof netConnect !== 'function') {
-      flashStatus('联机: 联机库未加载 · 仅单机模式');
+      flashStatus('Net: Multiplayer lib missing · single player');
       return;
     }
     // 点击立即反馈：Connecting…（Connected / Connection Failed 由 net.js 状态驱动显示）
@@ -1376,7 +1359,7 @@ function bindJoin() {
     flashStatus('Connecting…');
     netConnect()
       .then(() => {
-        flashStatus('Connected ✓ · 房间 ' + (window.shareRoom || ''), 3000);
+        flashStatus('Connected ✓ · Room ' + (window.shareRoom || ''), 3000);
       })
       .catch((err) => {
         // 不吞错误：把具体原因显示在状态行
@@ -1390,7 +1373,6 @@ function bindInput() {
   const canvasEl = document.querySelector('#canvas-container canvas');
   bindSwipe(canvasEl);
   bindTwoFingerTap(canvasEl);   // 双指点击 = 抢夺（不触发 Swipe/缩放）
-  bindDpad();
   bindKeyboard();
   bindJoin();
   bindStart();
@@ -1420,8 +1402,8 @@ function bindInput() {
  * ============================================================ */
 function reportInitError(stage, err) {
   const msg = err && err.message ? err.message : String(err);
-  if (typeof console !== 'undefined') console.error('[初始化异常]', stage, err);
-  setNetStatus('初始化异常 (' + stage + '): ' + msg);
+  if (typeof console !== 'undefined') console.error('[init error]', stage, err);
+  setNetStatus('Init error (' + stage + '): ' + msg);
 }
 
 /* 致命初始化错误（如画布创建失败）：状态行优先显示，不被常规连接状态覆盖 */
@@ -1455,9 +1437,9 @@ function setup() {
     // 诊断模式：不调用 netInit()、不访问 broker，直接使用本地单机状态
     try {
       initLocalState();
-      setNetStatus('诊断模式 · 本地状态就绪 · 不访问服务器');
+      setNetStatus('Diagnostic mode · local state ready · offline');
     } catch (err) {
-      reportInitError('诊断模式状态', err);
+      reportInitError('state', err);
       initLocalState();   // 兜底：确保 me / shared / guests 存在
     }
   } else {
@@ -1484,18 +1466,18 @@ function setup() {
         });
         // 防御：联机层已加载但未按预期创建全局状态 → 降级为单机，保证画面正常显示
         if (!window.me || !window.shared) {
-          throw new Error('联机层未创建 me/shared');
+          throw new Error('Net layer did not create me/shared');
         }
         if (!Array.isArray(window.guests)) window.guests = [];
       } else {
         // 未配置房间或联机库缺失：单机模式（me / shared / guests 为普通对象）
         initLocalState();
         if (!netLibReady) {
-          setNetStatus('联机: 联机库加载失败 · 单机画面可用 · 联机请刷新重试');
+          setNetStatus('Net: Multiplayer lib failed · single player available · refresh for online');
         }
       }
     } catch (err) {
-      reportInitError('联机', err);
+      reportInitError('network', err);
       initLocalState();   // 降级：本地单机状态，保证游戏能继续运行
     }
   }
@@ -1508,9 +1490,9 @@ function setup() {
     textFont('monospace');
     window.__gameCanvas = canvas.elt;
   } catch (err) {
-    fatalInitError = '画布创建出错 · ' + (err && err.message ? err.message : err);
-    setNetStatus('初始化失败: ' + fatalInitError);
-    if (typeof console !== 'undefined') console.error('[初始化异常] 画布', err);
+    fatalInitError = 'Canvas creation failed · ' + (err && err.message ? err.message : err);
+    setNetStatus('Init failed: ' + fatalInitError);
+    if (typeof console !== 'undefined') console.error('[init error] canvas', err);
     return;
   }
 
@@ -1518,7 +1500,7 @@ function setup() {
   try {
     bindInput();
   } catch (err) {
-    reportInitError('输入绑定', err);
+    reportInitError('input', err);
   }
 
   sensors.needPermission = needsSensorPermission();
@@ -1529,14 +1511,14 @@ function setup() {
     gameState.camera.x = t.x;
     gameState.camera.y = t.y;
   } catch (err) {
-    reportInitError('摄像机', err);
+    reportInitError('camera', err);
   }
 
   // ── 5) 初始化完成：显示明确的成功信息（瞬时提示后回到常规状态文本） ──
   if (debugState.mode) {
-    debugState.message = '初始化完成 · 不访问服务器';
+    debugState.message = 'Init complete · offline';
   } else {
-    flashStatus('初始化完成 ✓', 2500);
+    flashStatus('Init complete ✓', 2500);
   }
   setNetStatus(netStatusText());
 }

@@ -5,7 +5,7 @@
   <meta name="viewport"
         content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="theme-color" content="#181b26" />
-  <title>格子漫游 · Grid Walker</title>
+  <title>DECIDER</title>
 
   <link rel="stylesheet" href="style.css" />
 
@@ -43,7 +43,7 @@
 
       /* ---------- 状态行（缓冲式：loader 在 <head> 中运行时 #net-status 尚未解析） ---------- */
       var STATUS_COLOR = { info: '#ffd166', ok: '#7ee787', warn: '#f0c674', err: '#ff7b72' };
-      var lastStatus = { text: '加载中…', kind: 'info' };
+      var lastStatus = { text: 'Loading…', kind: 'info' };
       function applyStatus() {
         var el = document.getElementById('net-status');
         if (!el) return;
@@ -69,7 +69,7 @@
             done = true;
             s.onload = s.onerror = null;
             try { s.remove(); } catch (e) {}
-            reject(new Error('超时: ' + url.replace('https://', '')));
+            reject(new Error('Timeout: ' + url.replace('https://', '')));
           }, TIMEOUT);
           s.onload = function () {
             if (done) return;
@@ -82,7 +82,7 @@
             done = true;
             clearTimeout(timer);
             try { s.remove(); } catch (e) {}
-            reject(new Error('失败: ' + url.replace('https://', '')));
+            reject(new Error('Failed: ' + url.replace('https://', '')));
           };
           s.src = url;
           document.head.appendChild(s);
@@ -94,10 +94,10 @@
         var i = 0;
         function next() {
           if (i >= urls.length) {
-            return Promise.reject(new Error(name + ' 所有 CDN 源均加载失败'));
+            return Promise.reject(new Error(name + ' failed on all CDN sources'));
           }
           var url = urls[i++];
-          status('正在加载 ' + name + '… 第 ' + i + '/' + urls.length + ' 个源');
+          status('Loading ' + name + '… source ' + i + '/' + urls.length);
           return loadScript(url).catch(next);
         }
         return next();
@@ -113,12 +113,12 @@
         }
         if (instanceCreated) return;
         instanceCreated = true;
-        status('创建 p5 实例…');
+        status('Creating p5 instance…');
         try {
           new p5();
-          status('游戏已启动 ✓', 'ok');
+          status('Game started ✓', 'ok');
         } catch (e) {
-          status('初始化失败: ' + (e && e.message ? e.message : e) + ' · 请刷新重试', 'err');
+          status('Init failed: ' + (e && e.message ? e.message : e) + ' · refresh to retry', 'err');
         }
       }
 
@@ -126,7 +126,7 @@
         if (booted) return;
         if (!p5Ready || !sketchReady) return;
         if (typeof window.setup !== 'function') {
-          status('初始化失败: sketch.js 未定义 setup() · 请刷新重试', 'err');
+          status('Init failed: sketch.js did not define setup() · refresh to retry', 'err');
           booted = true;
           return;
         }
@@ -145,55 +145,55 @@
         // 看门狗（仅诊断报错，不用固定延迟启动游戏）
         setTimeout(function () {
           if (!window.__gameStarted) {
-            status('初始化未完成：游戏未启动 · 请刷新重试（持续出现请检查网络）', 'warn');
+            status('Init incomplete: game not started · refresh to retry (check network if this repeats)', 'warn');
           }
         }, 8000);
       }
 
-      status('加载中…');
+      status('Loading…');
       loadChain('p5')
         .then(function () {
           p5Ready = true;
-          status('p5.js 加载成功 ✓', 'ok');
+          status('p5.js loaded ✓', 'ok');
           // 诊断模式（?debug=local / #debug=local / sessionStorage debug=local）：
           // 跳过 SharedRoom 联机层，彻底排除联机与网络的影响
           var isDebug = false;
           try { isDebug = sessionStorage.getItem('debug') === 'local'; } catch (e) {}
           if (!isDebug) isDebug = /[?&]debug=local/.test(location.search) || /debug=local/.test(location.hash);
           if (isDebug) {
-            status('诊断模式: 跳过联机库 · 不访问服务器', 'warn');
+            status('Diagnostic mode: skipping network lib · offline', 'warn');
             return Promise.resolve();
           }
           // SharedRoom 联机层（本地文件，复用 DECIDER Phase2 的 MQTT 房间方案）
           return loadScript('js/vendor/mqtt.min.js?v=1')
             .then(function () {
               if (typeof mqtt === 'undefined' || typeof mqtt.connect !== 'function') {
-                throw new Error('mqtt.min.js 未导出 mqtt 全局变量');
+                throw new Error('mqtt.min.js did not export the mqtt global');
               }
-              status('联机库 mqtt.min.js 加载成功 ✓', 'ok');
+              status('mqtt.min.js loaded ✓', 'ok');
               return loadScript('js/net.js?v=1');
             })
             .then(function () {
               if (typeof netConnect !== 'function' || typeof netInit !== 'function') {
-                throw new Error('net.js 未定义 netInit()/netConnect()');
+                throw new Error('net.js did not define netInit()/netConnect()');
               }
-              status('联机层 net.js 加载成功 ✓', 'ok');
+              status('net.js loaded ✓', 'ok');
             })
             .catch(function (err) {
-              status('警告: 联机库未加载（' + (err && err.message ? err.message : err) + '）· 将使用单机模式', 'warn');
+              status('Warning: network lib failed (' + (err && err.message ? err.message : err) + ') · single-player mode', 'warn');
             });
         })
         .then(function () {
-          status('正在加载 sketch.js…');
-          return loadScript('sketch.js?v=7');
+          status('Loading sketch.js…');
+          return loadScript('sketch.js?v=8');
         })
         .then(function () {
           sketchReady = true;
-          status('sketch.js 加载成功 ✓', 'ok');
+          status('sketch.js loaded ✓', 'ok');
           onDependenciesReady();
         })
         .catch(function (err) {
-          status('初始化失败: ' + (err && err.message ? err.message : err) + ' · 请检查网络后刷新', 'err');
+          status('Init failed: ' + (err && err.message ? err.message : err) + ' · check your network and refresh', 'err');
         });
     })();
   </script>
@@ -203,21 +203,15 @@
     <!-- p5 画布挂载点（只显示角色附近的地图区域） -->
     <div id="canvas-container"></div>
 
-    <!-- 初始化/联机状态行：加载进度、JOIN 反馈、错误信息都在这里可见 -->
-    <div id="net-status">加载中…</div>
+    <!-- 状态行：加载进度、JOIN 反馈、错误信息都在这里可见 -->
+    <div id="net-status">Loading…</div>
 
-    <!-- 操作区：联机 + 开始 + 校准 + 备用方向按钮 -->
+    <!-- 操作区：JOIN + START + CALIBRATE（方向键只在桌面键盘上，手机用滑动/倾斜/双指） -->
     <div id="controls">
       <div id="control-top">
-        <button id="btn-join" class="cal-btn" aria-label="加入共享房间">JOIN</button>
-        <button id="btn-start" class="cal-btn" aria-label="开始游戏">START</button>
-        <button id="btn-calibrate" class="cal-btn" aria-label="校准倾斜传感器">CALIBRATE</button>
-      </div>
-      <div id="dpad">
-        <button id="btn-up"    class="dir-btn" aria-label="上">▲</button>
-        <button id="btn-left"  class="dir-btn" aria-label="左">◀</button>
-        <button id="btn-down"  class="dir-btn" aria-label="下">▼</button>
-        <button id="btn-right" class="dir-btn" aria-label="右">▶</button>
+        <button id="btn-join" class="cal-btn" aria-label="Join shared room">JOIN</button>
+        <button id="btn-start" class="cal-btn" aria-label="Start game">START</button>
+        <button id="btn-calibrate" class="cal-btn" aria-label="Calibrate tilt sensor">CALIBRATE</button>
       </div>
     </div>
   </div>

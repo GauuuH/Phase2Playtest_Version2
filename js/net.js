@@ -242,27 +242,30 @@ function _replaceGameLocal(value) {
   _setGameLocal(_snapshotGame());
 }
 
-/* 远端消息应用（LWW，_applyingRemote 期间不回发） */
+/* 远端消息应用（LWW，_applyingRemote 期间不回发）。
+ * 返回 true 表示本机状态确实发生了变化（用于收敛回广播）。 */
 
 function _applyCell(key, cell, stamp) {
-  if (!cell || typeof cell !== 'object') return;
-  if (_cmpStamp(stamp, _stampCell.get(key)) < 0) return;
+  if (!cell || typeof cell !== 'object') return false;
+  if (_cmpStamp(stamp, _stampCell.get(key)) < 0) return false;
   _stampCell.set(key, stamp);
   _applyingRemote = true;
   try { _sharedBacking.cells[key] = cell; } finally { _applyingRemote = false; }
+  return true;
 }
 
 function _applyObj(key, obj, stamp) {
-  if (!obj || typeof obj !== 'object') return;
-  if (_cmpStamp(stamp, _stampObj.get(key)) < 0) return;
+  if (!obj || typeof obj !== 'object') return false;
+  if (_cmpStamp(stamp, _stampObj.get(key)) < 0) return false;
   _stampObj.set(key, stamp);
   _applyingRemote = true;
   try { _sharedBacking.objects[key] = obj; } finally { _applyingRemote = false; }
+  return true;
 }
 
 function _applyGame(g, stamp) {
-  if (!g || typeof g !== 'object') return;
-  if (_cmpStamp(stamp, _stampGame) < 0) return;
+  if (!g || typeof g !== 'object') return false;
+  if (_cmpStamp(stamp, _stampGame) < 0) return false;
   _stampGame = stamp;
   _applyingRemote = true;
   try {
@@ -270,26 +273,33 @@ function _applyGame(g, stamp) {
     for (const k of Object.keys(cur)) delete cur[k];
     Object.assign(cur, g);
   } finally { _applyingRemote = false; }
+  return true;
 }
 
 function _applyCellsClear(stamp) {
+  let changed = false;
   for (const k of Object.keys(_sharedBacking.cells)) {
     if (_cmpStamp(stamp, _stampCell.get(k)) >= 0) {
       _applyingRemote = true;
       try { delete _sharedBacking.cells[k]; } finally { _applyingRemote = false; }
       _stampCell.set(k, stamp);
+      changed = true;
     }
   }
+  return changed;
 }
 
 function _applyObjsClear(stamp) {
+  let changed = false;
   for (const k of Object.keys(_sharedBacking.objects)) {
     if (_cmpStamp(stamp, _stampObj.get(k)) >= 0) {
       _applyingRemote = true;
       try { delete _sharedBacking.objects[k]; } finally { _applyingRemote = false; }
       _stampObj.set(k, stamp);
+      changed = true;
     }
   }
+  return changed;
 }
 
 /* 房间快照（cells/objects/game 全量 + 时间戳） */
@@ -320,17 +330,22 @@ function _onMessage(msg) {
 
   if (msg.t === 'room-state') {
     if (msg.id === _myId) return;
+    let changed = false;
     if (Array.isArray(msg.cells)) {
       for (const c of msg.cells) {
-        if (c && c.length >= 4) _applyCell(c[0], c[1], { ts: c[2], sid: c[3] });
+        if (c && c.length >= 4 && _applyCell(c[0], c[1], { ts: c[2], sid: c[3] })) changed = true;
       }
     }
     if (Array.isArray(msg.objects)) {
       for (const o of msg.objects) {
-        if (o && o.length >= 4) _applyObj(o[0], o[1], { ts: o[2], sid: o[3] });
+        if (o && o.length >= 4 && _applyObj(o[0], o[1], { ts: o[2], sid: o[3] })) changed = true;
       }
     }
-    if (msg.game) _applyGame(msg.game.g, { ts: msg.game.ts, sid: msg.game.sid });
+    if (msg.game && _applyGame(msg.game.g, { ts: msg.game.ts, sid: msg.game.sid })) changed = true;
+    /* 收敛回广播：若本地状态因该快照发生了变化（例如重连设备带回了
+     * 离线期间的本地写入，或本机缺少某些键），把自己的最新状态广播
+     * 回去，让所有设备继续收敛。应用后无变化则不再回发（避免循环）。 */
+    if (changed) _send(_roomStateMsg());
     return;
   }
 
@@ -463,14 +478,14 @@ function netInit(opts) {
 function netConnect() {
   return new Promise(function (resolve, reject) {
     if (typeof mqtt === 'undefined') {
-      const e = new Error('联机库 mqtt.min.js 未加载');
+      const e = new Error('mqtt.min.js library not loaded');
       window.shareStatus = 'error';
       window.shareError = e.message;
       reject(e);
       return;
     }
     if (typeof WebSocket === 'undefined') {
-      const e = new Error('浏览器不支持 WebSocket');
+      const e = new Error('WebSocket not supported by this browser');
       window.shareStatus = 'unsupported';
       window.shareError = e.message;
       reject(e);
@@ -499,8 +514,8 @@ let _brokerIndex = 0;
 function _tryBroker(resolve, reject) {
   if (_closedByUser) return;
   if (_brokerIndex >= _NET.BROKERS.length) {
-    const reason = _lastBrokerError ? '（最后错误: ' + _lastBrokerError + '）' : '';
-    const e = new Error('所有公共 broker 均无法连接' + reason);
+    const reason = _lastBrokerError ? ' (last error: ' + _lastBrokerError + ')' : '';
+    const e = new Error('All public MQTT brokers unreachable' + reason);
     window.shareStatus = 'error';
     window.shareError = e.message;
     reject(e);

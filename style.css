@@ -1,6 +1,6 @@
 /* ============================================================
- * 格子漫游 · Grid Walker
- * 手机竖屏布局：上方游戏画面 + 下方方向按钮
+ * DECIDER · Grid Walker
+ * 手机竖屏布局：游戏画面占主体 + 底部一行 JOIN / START / CALIBRATE
  * ============================================================ */
 
 * {
@@ -33,7 +33,7 @@ body {
   height: 100dvh;            /* 移动端动态视口高度（避开浏览器地址栏） */
 }
 
-/* 画布区域占满剩余空间 */
+/* 画布区域占满剩余空间（游戏画面的主体） */
 #canvas-container {
   flex: 1 1 auto;
   min-height: 0;
@@ -48,7 +48,7 @@ body {
   touch-action: none;        /* 画布上的滑动/触摸不触发页面滚动和缩放 */
 }
 
-/* 联机状态行：JOIN 点击反馈与连接失败提示都在这里可见 */
+/* 状态行：JOIN 点击反馈与连接失败提示都在这里可见（一行，尽量不遮挡画面） */
 #net-status {
   flex: 0 0 auto;
   width: 100%;
@@ -59,20 +59,16 @@ body {
   min-height: 16px;
 }
 
-/* ---- 操作区（JOIN + CALIBRATE + 备用方向按钮） ---- */
+/* ---- 操作区：底部一行 JOIN + START + CALIBRATE ---- */
 #controls {
   flex: 0 0 auto;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
   width: 100%;
-  max-width: 420px;
+  max-width: 480px;
   margin: 0 auto;
-  padding: 10px 16px calc(14px + env(safe-area-inset-bottom, 0px));
+  padding: 8px 12px calc(10px + env(safe-area-inset-bottom, 0px));
 }
 
-/* 顶部按钮行：JOIN（联机）+ CALIBRATE（倾斜校准） */
+/* 按钮行：三个按钮均分宽度，清晰可见、便于拇指点按 */
 #control-top {
   display: flex;
   gap: 10px;
@@ -81,15 +77,20 @@ body {
 
 /* CALIBRATE：以当前握持姿态作为倾斜中立角（iPhone 上同时请求传感器授权） */
 .cal-btn {
-  height: 42px;
-  padding: 0 22px;
-  border-radius: 21px;
+  flex: 1 1 0;
+  min-width: 0;
+  height: 48px;
+  padding: 0 8px;
+  border-radius: 24px;
   border: 2px solid rgba(255, 255, 255, 0.16);
   background: #2a3046;
   color: #ffffff;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
-  letter-spacing: 2px;
+  letter-spacing: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   touch-action: manipulation;
   cursor: pointer;
   box-shadow: 0 3px 0 rgba(0, 0, 0, 0.35);
@@ -112,47 +113,4 @@ body {
 .cal-btn:disabled:active {
   background: #2a3046;
   transform: none;
-}
-
-/* 方向按钮十字布局 */
-#dpad {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  grid-template-areas:
-    ".    up    ."
-    "left down right";
-  gap: 10px;
-  width: 100%;
-  justify-items: center;
-  align-items: center;
-}
-
-#btn-up    { grid-area: up; }
-#btn-left  { grid-area: left; }
-#btn-down  { grid-area: down; }
-#btn-right { grid-area: right; }
-
-.dir-btn {
-  width: 68px;
-  height: 68px;
-  border-radius: 18px;
-  border: 2px solid rgba(255, 255, 255, 0.16);
-  background: #2a3046;
-  color: #ffffff;
-  font-size: 26px;
-  line-height: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  touch-action: none;        /* 触摸立即响应，不触发浏览器手势 */
-  cursor: pointer;
-  box-shadow: 0 4px 0 rgba(0, 0, 0, 0.35);
-  transition: transform 0.05s ease, background 0.05s ease, box-shadow 0.05s ease;
-}
-
-/* 按下反馈 */
-.dir-btn:active {
-  background: #4a5578;
-  transform: translateY(3px) scale(0.97);
-  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.35);
 }
