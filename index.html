@@ -10,15 +10,21 @@
   <link rel="stylesheet" href="style.css" />
 
   <!--
-    依赖异步加载器：
+    依赖异步加载器（顺序：p5 → p5-phone → sketch.js）：
     · 每个 CDN 源最多等 7 秒（防止网络屏蔽时页面被同步 script 卡死）；
     · 失败自动换下一个源（jsdelivr → unpkg → cdnjs）；
-    · 每一步在页面底部状态行显示可见进度；
+    · 每一步在页面底部状态行显示可见进度（加载阶段 / 成功 / 错误）；
     · p5 必需；p5-phone 失败也继续（游戏降级为单机模式）；
-    · 全部依赖就绪后才加载 sketch.js（p5 全局模式兼容动态加载）。
+    · p5 与 sketch.js 全部就绪后，setup() 必定执行且只执行一次：
+      优先使用 p5 自身的 load 事件自动初始化（它自带 p5.instance 防重复判断），
+      仅当 load 已过去、自动初始化未生效时才手动 new p5()，并用
+      window.__gameStarted / p5.instance / 画布存在性三重判断防止重复实例；
+    · 不依赖任何固定延迟启动游戏（8 秒看门狗仅用于诊断报错）。
   -->
   <script>
     (function () {
+      'use strict';
+
       var CDN = {
         'p5': [
           'https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js',
@@ -32,9 +38,29 @@
       };
       var TIMEOUT = 7000;   // 单个 CDN 尝试超时（毫秒）
 
-      function status(text) {
+      /* 页面级启动状态：整个启动流程只执行一次 */
+      var p5Ready = false;
+      var sketchReady = false;
+      var booted = false;           // 依赖就绪后的启动流程只执行一次
+      var instanceCreated = false;  // 手动 new p5() 只允许一次
+
+      /* ---------- 状态行（缓冲式：loader 在 <head> 中运行时 #net-status 尚未解析） ---------- */
+      var STATUS_COLOR = { info: '#ffd166', ok: '#7ee787', warn: '#f0c674', err: '#ff7b72' };
+      var lastStatus = { text: '加载中…', kind: 'info' };
+      function applyStatus() {
         var el = document.getElementById('net-status');
-        if (el) el.textContent = text;
+        if (!el) return;
+        el.textContent = lastStatus.text;
+        el.style.color = STATUS_COLOR[lastStatus.kind] || STATUS_COLOR.info;
+      }
+      function status(text, kind) {
+        lastStatus = { text: text, kind: kind || 'info' };
+        applyStatus();
+      }
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', applyStatus);
+      } else {
+        applyStatus();
       }
 
       function loadScript(url) {
@@ -74,57 +100,90 @@
             return Promise.reject(new Error(name + ' 所有 CDN 源均加载失败'));
           }
           var url = urls[i++];
-          status('加载依赖 ' + name + '… 第 ' + i + '/' + urls.length + ' 个源');
+          status('正在加载 ' + name + '… 第 ' + i + '/' + urls.length + ' 个源');
           return loadScript(url).catch(next);
         }
         return next();
       }
 
-      function loadSketch() {
-        status('初始化…');
-        var s = document.createElement('script');
-        s.onerror = function () {
-          status('初始化失败: sketch.js 加载失败 · 请刷新重试');
-        };
-        s.src = 'sketch.js?v=5';
-        document.head.appendChild(s);
-        // 兜底：若页面早已完成加载而 p5 全局实例尚未建立，手动补建一次
+      /* ---------- 启动游戏：setup() 只执行一次、p5 实例只创建一次 ---------- */
+      function startGameNow() {
+        // 三重判断：setup 已执行过 / p5 已有全局实例 / 画布已存在 → 绝不重复创建
+        if (window.__gameStarted ||
+            (typeof p5 !== 'undefined' && p5.instance) ||
+            document.querySelector('#canvas-container canvas')) {
+          return;
+        }
+        if (instanceCreated) return;
+        instanceCreated = true;
+        status('创建 p5 实例…');
+        try {
+          new p5();
+          status('游戏已启动 ✓', 'ok');
+        } catch (e) {
+          status('初始化失败: ' + (e && e.message ? e.message : e) + ' · 请刷新重试', 'err');
+        }
+      }
+
+      function onDependenciesReady() {
+        if (booted) return;
+        if (!p5Ready || !sketchReady) return;
+        if (typeof window.setup !== 'function') {
+          status('初始化失败: sketch.js 未定义 setup() · 请刷新重试', 'err');
+          booted = true;
+          return;
+        }
+        booted = true;
+        if (document.readyState === 'complete') {
+          // window load 已过去：p5 的自动初始化当时看不到 setup()，必须手动创建
+          startGameNow();
+        } else {
+          // load 未到：p5 会在 load 时自行创建实例（此刻 setup() 已就绪）。
+          // 本监听器只做兜底——setTimeout(0) 让 p5 的自动初始化先执行，
+          // 若它没生效（无实例、无画布、setup 没跑）再手动补建。
+          window.addEventListener('load', function () {
+            setTimeout(startGameNow, 0);
+          });
+        }
+        // 看门狗（仅诊断报错，不用固定延迟启动游戏）
         setTimeout(function () {
-          if (document.readyState === 'complete' &&
-              typeof p5 !== 'undefined' && !p5.instance &&
-              typeof window.setup === 'function') {
-            try { new p5(); } catch (e) {
-              status('初始化失败: ' + (e && e.message ? e.message : e));
-            }
+          if (!window.__gameStarted) {
+            status('初始化未完成：游戏未启动 · 请刷新重试（持续出现请检查网络）', 'warn');
           }
-        }, 1500);
-        // 看门狗：10 秒后仍无画面 → 显示诊断信息
-        setTimeout(function () {
-          if (typeof p5 !== 'undefined' && window.frameCount === undefined) {
-            status('初始化超时 · 请刷新重试（持续出现请检查网络）');
-          }
-        }, 10000);
+        }, 8000);
       }
 
       status('加载中…');
       loadChain('p5')
         .then(function () {
+          p5Ready = true;
+          status('p5.js 加载成功 ✓', 'ok');
           // 诊断模式（?debug=local / #debug=local / sessionStorage debug=local）：
           // 跳过 p5-phone，彻底排除联机库与 CDN 的影响
           var isDebug = false;
           try { isDebug = sessionStorage.getItem('debug') === 'local'; } catch (e) {}
           if (!isDebug) isDebug = /[?&]debug=local/.test(location.search) || /debug=local/.test(location.hash);
           if (isDebug) {
-            status('诊断模式: 跳过 p5-phone · 不访问服务器');
+            status('诊断模式: 跳过 p5-phone · 不访问服务器', 'warn');
             return Promise.resolve();
           }
-          return loadChain('p5-phone').catch(function () {
-            status('警告: p5-phone 未加载 · 仅单机模式，联机不可用');
+          return loadChain('p5-phone').then(function () {
+            status('p5-phone 加载成功 ✓', 'ok');
+          }).catch(function () {
+            status('警告: p5-phone 未加载 · 将使用单机模式', 'warn');
           });
         })
-        .then(loadSketch)
+        .then(function () {
+          status('正在加载 sketch.js…');
+          return loadScript('sketch.js?v=6');
+        })
+        .then(function () {
+          sketchReady = true;
+          status('sketch.js 加载成功 ✓', 'ok');
+          onDependenciesReady();
+        })
         .catch(function (err) {
-          status('初始化失败: ' + (err && err.message ? err.message : err) + ' · 请检查网络后刷新');
+          status('初始化失败: ' + (err && err.message ? err.message : err) + ' · 请检查网络后刷新', 'err');
         });
     })();
   </script>
