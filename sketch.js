@@ -4,24 +4,32 @@
  * 24×24 格子地图 + Camera Follow（只跟随自己的角色）
  * 手机竖屏游戏，电脑仅用于开发调试
  *
- * ── 架构（为将来 p5-phone-share 多人同步预留） ──
- * 本游戏没有“电脑 Host 大屏”：
- *   未来每位玩家都在自己的手机上运行同一个页面，
- *   显示同一张共享地图，摄像机只跟随自己的角色。
- * 多人接入时：
- *   - gameState.players 会放进所有玩家的位置（现在只有 me）；
- *   - 手机间用 p5-phone-share 的 shared 状态 / shareEmit 同步按键，
- *     每台手机收到别人的按键后调用同一个 movePlayer(id, dx, dy)；
- *   - 渲染与摄像机代码不需要改动（drawPlayers 已按多人循环写）。
- * 电脑在本项目中仅用于开发与调试（键盘 WASD / 方向键）。
+ * ── 多人架构（p5-phone-share = p5-phone 1.15.0 的 Share 功能） ──
+ * 没有“电脑 Host 大屏”：每部手机运行同一个页面，显示同一张共享地图，
+ * 摄像机只跟随自己的角色。共享状态全部由 p5-phone 的同步服务器
+ * （Cloudflare PartyServer Worker）作为唯一数据源：
+ *
+ *   me     —— 本机玩家的状态（x, y, color）。写入 me.x / me.y 时，
+ *             p5-phone 会自动把它同步给房间里其他手机；断线期间改动
+ *             保存在本地，重连时随 hello 消息补发（已核实 1.15.0 源码）。
+ *   guests —— 其他在线玩家的 me 快照数组（每个带 id），由 p5-phone
+ *             的 welcome / presence 消息自动维护，加入、离开、断线重连
+ *             都不需要我们处理。
+ *
+ * 关键约定（避免设备间互相覆盖）：
+ *   · 每台手机只写自己的 me，绝不写别人的状态；
+ *   · 位置冲突天然不存在：每个玩家的坐标只属于他自己的 me；
+ *   · 颜色/出生点：新玩家连接后从共享可见的 guests 里找第一个空闲颜色，
+ *     出生点由颜色下标确定（所有设备用同一张表，结果一致）；
+ *     若两人同时拿到同色，id 字典序大的那台让位重选，自动收敛。
+ *
+ * 移动同步不需要 shareEmit / shared：me 的自动补丁已覆盖全部需求。
  *
  * ── 操作方式（手机） ──
- *   · Swipe：在游戏画面上向上/向下滑动，每次移动一格
- *   · Tilt ：左右倾斜手机横向移动；越过死区立即走一格，
- *            之后按固定间隔连续移动，回到中立角度停止
- *   · CALIBRATE：把当前握持姿态设为倾斜中立角
- *            （iPhone 上同时通过按钮请求方向传感器授权）
- *   · 屏幕方向按钮：备用操作，保证不支持倾斜的设备也能玩
+ *   · Swipe：画面上滑/下滑，每次移动一格
+ *   · Tilt ：左右倾斜横向移动（死区 + 定间隔），CALIBRATE 校准中立角
+ *   · 方向按钮：备用操作
+ *   · JOIN：加入共享房间（iPhone 等也通过它完成必要的手势）
  * ── 操作方式（桌面调试） ──
  *   · 方向键 / WASD
  * ============================================================ */
@@ -35,17 +43,46 @@ const WORLD_W = GRID * CELL;  // 地图总宽 960px
 const WORLD_H = GRID * CELL;  // 地图总高 960px（大于手机屏幕）
 
 /* ---------------- 操作配置 ---------------- */
-const SWIPE_DIST   = 30;    // 滑动判定距离（px），小于此距离不算滑动
-const TILT_DEADZONE = 5;    // 倾斜死区（°），|当前 - 中立| < 死区不移动，防止手抖误触发
+const SWIPE_DIST   = 30;    // 滑动判定距离（px）
+const TILT_DEADZONE = 5;    // 倾斜死区（°），防止手抖误触发
 const TILT_INTERVAL = 220;  // 倾斜越过死区后的固定移动间隔（ms）
 const TILT_SIGN = 1;        // 个别设备若左右方向颠倒，改成 -1
 
-/* ---------------- 游戏状态（未来多人同步的唯一数据源） ---------------- */
+/* ---------------- 联机配置 ---------------- */
+const SHARE_CONFIG = {
+  host: '',              // ← 老师提供的 Worker URL（https://xxx.workers.dev）填这里；
+                         //   也可不改代码，用 ?shareHost=…&room=… 链接参数覆盖（p5-phone 原生支持）
+  room: 'grid-walker',   // 房间名：同一房间的手机互相可见
+  app: 'phase2-playtest'
+};
+
+const MAX_PLAYERS = 7;   // 架构预留：最多 7 名玩家（先支持 2 部手机测试）
+
+/* 7 种玩家颜色（下标 = 颜色编号，全部设备一致） */
+const PALETTE = [
+  [255, 118, 87],    // 0 珊瑚红
+  [255, 199, 89],    // 1 琥珀
+  [111, 194, 255],   // 2 天蓝
+  [151, 220, 121],   // 3 草绿
+  [206, 131, 255],   // 4 紫
+  [255, 140, 199],   // 5 粉
+  [117, 230, 218]    // 6 青
+];
+
+/* 7 个出生点（下标 = 颜色编号，所有设备一致） */
+const SPAWNS = [
+  { x: 12, y: 12 },  // 中央
+  { x: 2,  y: 2  },  // 左上
+  { x: 21, y: 2  },  // 右上
+  { x: 2,  y: 21 },  // 左下
+  { x: 21, y: 21 },  // 右下
+  { x: 12, y: 2  },  // 上中
+  { x: 12, y: 21 }   // 下中
+];
+
+/* ---------------- 游戏状态（摄像机等本地状态） ---------------- */
+/* 玩家状态不在本地对象里：自己在 p5-phone 的 me 里，他人在 guests 里 */
 const gameState = {
-  players: {
-    // 出生在地图正中央 (12, 12)
-    me: { x: GRID / 2, y: GRID / 2, color: [255, 118, 87] }
-  },
   camera: { x: 0, y: 0 }   // 摄像机左上角的世界坐标（像素）
 };
 
@@ -65,21 +102,74 @@ const sensors = {
 };
 
 /* ============================================================
- * 移动逻辑 —— 唯一入口，与输入方式无关
- * 角色不能离开地图边界（0 ~ GRID-1）
+ * 联机工具
  * ============================================================ */
-function movePlayer(id, dx, dy) {
-  const p = gameState.players[id];
-  if (!p) return;
-  p.x = constrain(p.x + dx, 0, GRID - 1);
-  p.y = constrain(p.y + dy, 0, GRID - 1);
+function isShareConfigured() {
+  if (SHARE_CONFIG.host && SHARE_CONFIG.host.trim()) return true;
+  try { return !!new URLSearchParams(location.search).get('shareHost'); }
+  catch (e) { return false; }
+}
+
+function isConnected() {
+  return window.shareConnected === true;
+}
+
+function getMyId() {
+  return String(window.shareClientId || '');
+}
+
+function onlineCount() {
+  if (!isConnected()) return 1;
+  return 1 + (Array.isArray(window.guests) ? window.guests.length : 0);
 }
 
 /* ============================================================
- * 摄像机 —— Camera Follow（只跟随自己的角色）
- * 目标位置：让玩家保持在屏幕中央；
- * 靠近地图边缘时钳制摄像机，不显示地图外的区域；
- * 地图比屏幕小时则居中显示地图。
+ * 移动逻辑 —— 唯一入口，与输入方式无关
+ * 只写自己的 me；边界检查在这里做（0 ~ GRID-1）。
+ * p5-phone 会把 me 的改动自动同步给其他手机。
+ * ============================================================ */
+function moveMe(dx, dy) {
+  const nx = constrain(me.x + dx, 0, GRID - 1);
+  const ny = constrain(me.y + dy, 0, GRID - 1);
+  me.x = nx;   // 已连接：自动同步；未连接：本地保存，连接时随 hello 补发
+  me.y = ny;
+}
+
+/* ============================================================
+ * 颜色 / 出生点分配（每帧调用，仅在已连接时生效）
+ * 说明：1.15.0 没有 shareJoined 回调，所以用轻量轮询；
+ *       guests 最多 7 人，每帧扫一遍开销可忽略。
+ * ============================================================ */
+function ensureMyColor() {
+  if (!isConnected()) return;
+  const myId = getMyId();
+  const gs = window.guests || [];
+  const myColor = typeof me.color === 'number' ? me.color : -1;
+
+  // 已有颜色且不冲突 → 不动
+  if (myColor >= 0 && myColor < PALETTE.length) {
+    const clash = gs.find(g => g.color === myColor && String(g.id) > myId);
+    if (!clash) return;
+  }
+
+  // 新玩家分配 / 冲突让位：找第一个空闲颜色
+  const used = new Set();
+  for (const g of gs) if (typeof g.color === 'number') used.add(g.color);
+  let idx = 0;
+  while (used.has(idx) && idx < PALETTE.length) idx++;
+  idx = idx % PALETTE.length;
+
+  const isNew = myColor < 0;
+  me.color = idx;
+  if (isNew) {
+    const s = SPAWNS[idx % SPAWNS.length];
+    me.x = s.x;   // 新玩家放到自己的出生点；重连玩家保留原位置
+    me.y = s.y;
+  }
+}
+
+/* ============================================================
+ * 摄像机 —— Camera Follow（只跟随自己的角色 me）
  * ============================================================ */
 function clampCam(tx, ty) {
   return {
@@ -88,20 +178,17 @@ function clampCam(tx, ty) {
   };
 }
 
-function camTarget(me) {
+function camTarget(p) {
   return {
-    x: me.x * CELL + CELL / 2 - width / 2,
-    y: me.y * CELL + CELL / 2 - height / 2
+    x: p.x * CELL + CELL / 2 - width / 2,
+    y: p.y * CELL + CELL / 2 - height / 2
   };
 }
 
 function updateCamera() {
-  const me  = gameState.players.me;
   const cam = gameState.camera;
   const t   = clampCam(camTarget(me).x, camTarget(me).y);
-
-  // 平滑跟随，让移动观感更舒服
-  cam.x = lerp(cam.x, t.x, 0.18);
+  cam.x = lerp(cam.x, t.x, 0.18);   // 平滑跟随
   cam.y = lerp(cam.y, t.y, 0.18);
 }
 
@@ -116,7 +203,6 @@ function needsSensorPermission() {
 }
 
 // 当前屏幕方向：0 竖屏，90 / -90 横屏
-// 新 API 用 screen.orientation.angle；旧 iOS Safari 用 window.orientation
 function screenAngle() {
   if (window.screen && screen.orientation && typeof screen.orientation.angle === 'number') {
     return screen.orientation.angle;
@@ -128,15 +214,12 @@ function onDeviceOrientation(e) {
   const g = e.gamma, b = e.beta;
   if (g == null || b == null || isNaN(g) || isNaN(b)) return;
 
-  // 竖屏：gamma 即左右倾斜（正值 = 向右）；
-  // 横屏：旋转轴对调，改用 beta（尽力而为，本游戏以竖屏为主）
   const angle = Math.abs(screenAngle());
-  const tilt = (angle === 90 || angle === 270) ? -b : g;
+  const tilt = (angle === 90 || angle === 270) ? -b : g;  // 横屏时轴对调（降级）
 
   sensors.latest = tilt * TILT_SIGN;
   sensors.available = true;
 
-  // 按下校准时还没有数据 → 现在用第一条数据完成校准
   if (sensors.pendingCalibrate) {
     sensors.pendingCalibrate = false;
     sensors.neutral = tilt * TILT_SIGN;
@@ -152,16 +235,14 @@ function calibrateTilt() {
     sensors.calibrated = true;
     sensors.dir = 0;
   } else {
-    sensors.pendingCalibrate = true;    // 等第一条传感器数据
+    sensors.pendingCalibrate = true;
   }
 }
 
-// CALIBRATE 按钮：
-//  · iPhone（iOS 13+）需要用户手势请求传感器授权 → 通过按钮完成，
-//    授权成功后直接以当前姿态校准；被拒绝则 HUD 提示，不报错
-//  · Android / 桌面无需授权 → 直接校准
+// CALIBRATE 按钮：iPhone（iOS 13+）通过按钮请求传感器授权；
+// 授权成功直接以当前姿态校准；被拒绝则 HUD 提示，不报错。
 function onCalibratePress() {
-  tryLockPortrait();   // 借用户手势尽力锁定竖屏（不支持则静默失败）
+  tryLockPortrait();
 
   if (needsSensorPermission() && !sensors.permissionAsked) {
     sensors.permissionAsked = true;
@@ -195,15 +276,14 @@ function updateTilt() {
   if (dir !== sensors.dir) {
     sensors.dir = dir;
     sensors.lastMoveAt = now;
-    movePlayer('me', dir, 0);            // 刚越过阈值：立即走一格
+    moveMe(dir, 0);                      // 刚越过阈值：立即走一格
   } else if (now - sensors.lastMoveAt >= TILT_INTERVAL) {
     sensors.lastMoveAt = now;
-    movePlayer('me', dir, 0);            // 保持倾斜：按固定间隔走格
+    moveMe(dir, 0);                      // 保持倾斜：按固定间隔走格
   }
 }
 
-// 尽力把屏幕锁定为竖屏；需要全屏 / 用户手势的浏览器会拒绝 → 静默忽略，
-// 布局本身自适应，横屏只是降级而不是崩溃
+// 尽力锁定竖屏；不支持则静默忽略（布局本身自适应）
 function tryLockPortrait() {
   try {
     if (screen.orientation && screen.orientation.lock) {
@@ -219,14 +299,12 @@ function drawTiles() {
   noStroke();
   for (let y = 0; y < GRID; y++) {
     for (let x = 0; x < GRID; x++) {
-      // 棋盘格底色，便于看清每一格和摄像机的移动
       fill((x + y) % 2 === 0 ? '#8fae6b' : '#84a362');
       rect(x * CELL, y * CELL, CELL, CELL);
       drawLandmark(x, y);
     }
   }
 
-  // 淡淡的网格线
   stroke(0, 0, 0, 25);
   strokeWeight(1);
   for (let i = 0; i <= GRID; i++) {
@@ -235,18 +313,18 @@ function drawTiles() {
   }
 }
 
-// 确定性“随机”地标（石头 / 树），验证移动和摄像机时更直观
+// 确定性“随机”地标（石头 / 树）
 function drawLandmark(x, y) {
   const h = Math.floor(Math.abs(Math.sin(x * 127.1 + y * 311.7) * 43758.5453)) % 100;
   const cx = x * CELL + CELL / 2;
   const cy = y * CELL + CELL / 2;
 
-  if (h < 8) {                      // ~8% 石头
+  if (h < 8) {
     fill(140, 140, 152);
     circle(cx, cy, CELL * 0.34);
     fill(108, 108, 120);
     circle(cx, cy + 2, CELL * 0.2);
-  } else if (h < 18) {              // ~10% 树
+  } else if (h < 18) {
     fill(60, 110, 66);
     circle(cx, cy - CELL * 0.08, CELL * 0.55);
     fill(46, 88, 52);
@@ -261,41 +339,66 @@ function drawBorder() {
   rect(0, 0, WORLD_W, WORLD_H);
 }
 
+function colorOf(i) {
+  return PALETTE[typeof i === 'number' && i >= 0 && i < PALETTE.length ? i : 0];
+}
+
+// 渲染自己（me）+ 所有在线玩家（guests，由 p5-phone 自动维护）
 function drawPlayers() {
-  for (const id in gameState.players) {
-    const p  = gameState.players[id];
-    const cx = p.x * CELL + CELL / 2;
-    const cy = p.y * CELL + CELL / 2;
+  drawOnePlayer({ x: me.x, y: me.y, color: colorOf(me.color) }, true);
 
-    // 影子
-    noStroke();
-    fill(0, 0, 0, 60);
-    ellipse(cx, cy + CELL * 0.3, CELL * 0.72, CELL * 0.26);
-
-    // 角色：彩色圆形
-    fill(p.color);
-    stroke(255, 255, 255, 230);
-    strokeWeight(3);
-    circle(cx, cy, CELL * 0.66);
+  const gs = window.guests || [];
+  for (const g of gs) {
+    drawOnePlayer({ x: g.x, y: g.y, color: colorOf(g.color) }, false);
   }
 }
 
-// 屏幕左上角 HUD：当前格子坐标 + 倾斜传感器状态
+function drawOnePlayer(p, isSelf) {
+  const cx = p.x * CELL + CELL / 2;
+  const cy = p.y * CELL + CELL / 2;
+
+  // 影子
+  noStroke();
+  fill(0, 0, 0, 60);
+  ellipse(cx, cy + CELL * 0.3, CELL * 0.72, CELL * 0.26);
+
+  // 角色：彩色圆形（自己描边更醒目）
+  fill(p.color);
+  stroke(255, 255, 255, isSelf ? 255 : 180);
+  strokeWeight(isSelf ? 3 : 2);
+  circle(cx, cy, CELL * 0.66);
+
+  // 自己头顶的标记
+  if (isSelf) {
+    noStroke();
+    fill(255);
+    textSize(12);
+    textAlign(CENTER, BOTTOM);
+    text('你', cx, cy - CELL * 0.5);
+  }
+}
+
+// HUD：坐标 + 倾斜状态 + 联机状态
 function drawHUD() {
-  const me = gameState.players.me;
-  const line1 = 'X ' + me.x + ' · Y ' + me.y;
-  const line2 = sensorStatusText();
+  const lines = [
+    'X ' + me.x + ' · Y ' + me.y,
+    sensorStatusText(),
+    connectionText()
+  ];
 
   textSize(14);
   textAlign(LEFT, TOP);
-  const w = Math.max(textWidth(line1), textWidth(line2)) + 20;
+  let w = 0;
+  for (const l of lines) w = Math.max(w, textWidth(l));
+  w += 20;
 
   noStroke();
   fill(0, 0, 0, 0.45);
-  rect(8, 8, w, 46, 8);
+  rect(8, 8, w, lines.length * 16 + 16, 8);
   fill(255);
-  text(line1, 18, 14);
-  text(line2, 18, 30);
+  for (let i = 0; i < lines.length; i++) {
+    text(lines[i], 18, 14 + i * 16);
+  }
 }
 
 function sensorStatusText() {
@@ -317,11 +420,33 @@ function sensorStatusText() {
   return '倾斜: 点 CALIBRATE 校准';
 }
 
+function connectionText() {
+  if (!isShareConfigured()) return '联机: 未配置服务器';
+  const st = window.shareStatus;
+  if (st === 'connected') return '联机: 已连接 · 在线 ' + onlineCount() + '/' + MAX_PLAYERS;
+  if (st === 'connecting') return '联机: 连接中…';
+  if (st === 'error') return '联机: 连接失败 · 检查服务器';
+  if (st === 'unsupported') return '联机: 浏览器不支持';
+  return '联机: 点 JOIN 加入房间';
+}
+
+/* JOIN 按钮状态跟随连接状态变化 */
+let lastJoinBtnState = null;
+function updateJoinButton() {
+  const btn = document.getElementById('btn-join');
+  if (!btn) return;
+  const state = !isShareConfigured() ? 'noconfig' : (isConnected() ? 'joined' : 'join');
+  if (state === lastJoinBtnState) return;
+  lastJoinBtnState = state;
+  btn.disabled = state !== 'join';
+  btn.textContent = state === 'noconfig' ? '无服务器' : state === 'joined' ? '已连接 ✓' : 'JOIN';
+}
+
 /* ============================================================
  * 输入
  * ============================================================ */
 
-// Swipe：在游戏画面上向上/向下滑动，每次移动一格
+// Swipe：画面上滑/下滑，每次移动一格
 function bindSwipe(canvasEl) {
   let start = null;
 
@@ -334,9 +459,9 @@ function bindSwipe(canvasEl) {
     const dx = e.clientX - start.x;
     const dy = e.clientY - start.y;
     start = null;
-    if (Math.abs(dy) < SWIPE_DIST) return;      // 距离不够 → 忽略
-    if (Math.abs(dy) <= Math.abs(dx)) return;   // 横向为主 → 忽略（横向留给倾斜）
-    movePlayer('me', 0, dy < 0 ? -1 : 1);       // 上滑向上走一格，下滑向下走一格
+    if (Math.abs(dy) < SWIPE_DIST) return;
+    if (Math.abs(dy) <= Math.abs(dx)) return;
+    moveMe(0, dy < 0 ? -1 : 1);
   };
   canvasEl.addEventListener('pointerup', finish);
   canvasEl.addEventListener('pointercancel', () => { start = null; });
@@ -357,7 +482,7 @@ function bindDpad() {
     const dir = dirs[id];
     btn.addEventListener('pointerdown', (e) => {
       e.preventDefault();
-      movePlayer('me', dir.dx, dir.dy);
+      moveMe(dir.dx, dir.dy);
     });
     btn.addEventListener('contextmenu', (e) => e.preventDefault());
   }
@@ -375,7 +500,19 @@ function bindKeyboard() {
     const dir = keyMap[e.key];
     if (dir) {
       e.preventDefault();
-      movePlayer('me', dir.dx, dir.dy);
+      moveMe(dir.dx, dir.dy);
+    }
+  });
+}
+
+// JOIN：加入共享房间（必须在用户手势里调用 shareConnect）
+function bindJoin() {
+  const btn = document.getElementById('btn-join');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    if (!isShareConfigured() || isConnected()) return;
+    if (typeof shareConnect === 'function') {
+      shareConnect().catch(() => {});
     }
   });
 }
@@ -384,6 +521,7 @@ function bindInput() {
   bindSwipe(document.querySelector('#canvas-container canvas'));
   bindDpad();
   bindKeyboard();
+  bindJoin();
 
   const calBtn = document.getElementById('btn-calibrate');
   if (calBtn) calBtn.addEventListener('click', onCalibratePress);
@@ -392,7 +530,7 @@ function bindInput() {
 
   // 阻止 Swipe / 触摸导致页面滚动与浏览器缩放
   document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
-  document.addEventListener('gesturestart', (e) => e.preventDefault());   // iOS 双指缩放
+  document.addEventListener('gesturestart', (e) => e.preventDefault());
 }
 
 /* ============================================================
@@ -404,11 +542,30 @@ function setup() {
   canvas.parent(holder);
   textFont('monospace');
 
+  // p5-phone：锁定手机手势（embedded 模式只作用于画布）
+  if (typeof lockGestures === 'function') {
+    lockGestures({ mode: 'embedded', element: canvas.elt });
+  }
+
   sensors.needPermission = needsSensorPermission();
 
-  // 摄像机初始就对正玩家，避免开局从 (0,0) 飞过来
-  const me = gameState.players.me;
-  const t  = clampCam(camTarget(me).x, camTarget(me).y);
+  // 多人共享状态初始化（p5-phone Share）
+  if (isShareConfigured()) {
+    shareSetup({
+      host: SHARE_CONFIG.host,       // URL 参数 ?shareHost= 优先于这里
+      room: SHARE_CONFIG.room,
+      app: SHARE_CONFIG.app,
+      me: { x: 12, y: 12, color: -1 }   // color -1 = 未分配，连接后自动分配
+    });
+    if (typeof showDesktopQr === 'function') showDesktopQr();  // 桌面二维码邀请（手机端自动不显示）
+  } else {
+    // 单机模式：未配置服务器时仍可本地游玩（me 为普通对象）
+    window.me = { x: 12, y: 12, color: 0 };
+    window.guests = window.guests || [];
+  }
+
+  // 摄像机初始就对正玩家
+  const t = clampCam(camTarget(me).x, camTarget(me).y);
   gameState.camera.x = t.x;
   gameState.camera.y = t.y;
 
@@ -419,6 +576,8 @@ function draw() {
   background('#181b26');   // 地图外区域的颜色
 
   updateTilt();
+  ensureMyColor();         // 连接后：分配颜色/出生点、解决颜色冲突
+  updateJoinButton();
   updateCamera();
 
   push();

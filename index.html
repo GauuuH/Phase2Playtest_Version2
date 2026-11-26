@@ -12,18 +12,20 @@
   <!-- p5.js -->
   <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
 
-  <!-- 将来接入 p5-phone-share 多人同步时取消注释（p5-phone 的 Share 功能）:
-  <script src="https://cdn.jsdelivr.net/npm/p5-phone@1.16.1/dist/p5-phone.min.js"></script>
-  -->
+  <!-- p5-phone（老师的模板同款版本）：手势锁定 + Share 多人同步 -->
+  <script src="https://cdn.jsdelivr.net/npm/p5-phone@1.15.0/dist/p5-phone.min.js"></script>
 </head>
 <body>
   <div id="game">
     <!-- p5 画布挂载点（只显示角色附近的地图区域） -->
     <div id="canvas-container"></div>
 
-    <!-- 操作区：校准按钮 + 备用方向按钮 -->
+    <!-- 操作区：联机 + 校准 + 备用方向按钮 -->
     <div id="controls">
-      <button id="btn-calibrate" class="cal-btn" aria-label="校准倾斜传感器">CALIBRATE</button>
+      <div id="control-top">
+        <button id="btn-join" class="cal-btn" aria-label="加入共享房间">JOIN</button>
+        <button id="btn-calibrate" class="cal-btn" aria-label="校准倾斜传感器">CALIBRATE</button>
+      </div>
       <div id="dpad">
         <button id="btn-up"    class="dir-btn" aria-label="上">▲</button>
         <button id="btn-left"  class="dir-btn" aria-label="左">◀</button>
