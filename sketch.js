@@ -40,6 +40,36 @@
  *   · 主人 ID 与颜色同一条记录一起写，不存在字段撕裂。
  * 未连接服务器时不做本地占地（加入后地图以服务器为准，避免各设备不一致）。
  *
+ * ── Object（拾取/携带/交付）同步方案 —— 已核实 1.15.0 源码后选择 ──
+ * 状态：shared.objects[objId] = { state: 'ground'|'carried'|'delivered', by: 携带者ID }
+ *   · 拾取 = 写 { state:'carried', by:我的ID }；交付 = 写 { state:'delivered', by:我的ID }；
+ *   · 每台手机只写自己参与的转移，绝不替别人改状态；
+ *   · 自己携带什么放在 me.carryingObject（Object ID 或 null），随 me 自动同步。
+ *
+ * 【关于“同时拾取同一 Object 只有一人成功”（要求 10）的如实说明】
+ *   p5-phone 1.15.0 / 现有 Worker 没有提供 CAS（原子比较交换）或专门的服务端
+ *   裁决 API。它提供的保证是：同 key 的补丁由 worker 按到达顺序串行应用
+ *   （last-write-wins），并且所有设备都会收敛到 worker 的同一份值。
+ *   因此本实现采用「宣告 + 回滚」：
+ *     1. 双方都可能先写出 { carried, by:自己 } 并短暂以为自己成功；
+ *     2. worker 按到达顺序定出唯一赢家（写入 shared.objects[objId].by）；
+ *     3. 输家看到 by ≠ 自己 → 自动放下（resolveObjectConflicts，每帧检查）。
+ *   结果：所有设备最终一致，只有一个携带者；但存在亚秒级的“双携带”过渡窗口
+ *   （手机上前台传播 <1s）。这不是严格意义上的互斥锁，是“服务器定序 + 客户端
+ *   回滚”的最终一致性方案——如实记录，不冒充原子操作。
+ *   未来若需要严格互斥，需要 Worker 增加 CAS 语义（当前版本没有）。
+ *
+ * ── 基地与交付 ──
+ *   每个玩家的基地 = 自己的出生点（me.baseX / me.baseY，加入时写入并随 me 同步）。
+ *   携带 Object 走回自己基地格 → 自动交付：objects[objId] 标记 delivered，
+ *   清空 carryingObject，me.delivered +1，恢复占地能力。
+ *   delivered 的 Object 不再刷新（刷新规则以后再定）。
+ *
+ * ── 预留：双指抢夺接口 ──
+ *   claimObject(objId) 即所有权转移入口：把 by 写成新携带者即可，
+ *   原携带者会在 resolveObjectConflicts() 中自动放下。将来在输入层
+ *   （双指手势）调用即可，无需改同步逻辑。本阶段不接线。
+ *
  * ── 操作方式（手机） ──
  *   · Swipe：画面上滑/下滑，每次移动一格
  *   · Tilt ：左右倾斜横向移动（死区 + 定间隔），CALIBRATE 校准中立角
@@ -83,7 +113,7 @@ const PALETTE = [
   [117, 230, 218]    // 6 青
 ];
 
-/* 7 个出生点（下标 = 颜色编号，所有设备一致） */
+/* 7 个出生点（下标 = 颜色编号，所有设备一致）；同时是各玩家的基地 */
 const SPAWNS = [
   { x: 12, y: 12 },  // 中央
   { x: 2,  y: 2  },  // 左上
@@ -92,6 +122,14 @@ const SPAWNS = [
   { x: 21, y: 21 },  // 右下
   { x: 12, y: 2  },  // 上中
   { x: 12, y: 21 }   // 下中
+];
+
+/* 4 个公共 Object：唯一 ID + 固定初始位置（地图中央区域，避开出生点） */
+const OBJECTS = [
+  { id: 'o1', x: 10, y: 10 },
+  { id: 'o2', x: 13, y: 10 },
+  { id: 'o3', x: 10, y: 13 },
+  { id: 'o4', x: 13, y: 13 }
 ];
 
 /* ---------------- 游戏状态（摄像机等本地状态） ---------------- */
@@ -132,6 +170,11 @@ function getMyId() {
   return String(window.shareClientId || '');
 }
 
+// 写入共享状态时用的“我的身份”：联机 = 服务器分配 ID；单机模式 = 'local'
+function myOwnerId() {
+  return isShareConfigured() ? String(window.shareClientId || '') : 'local';
+}
+
 function onlineCount() {
   if (!isConnected()) return 1;
   return 1 + (Array.isArray(window.guests) ? window.guests.length : 0);
@@ -140,16 +183,17 @@ function onlineCount() {
 /* ============================================================
  * 移动逻辑 —— 唯一入口，与输入方式无关
  * 只写自己的 me；边界检查在这里做（0 ~ GRID-1）。
- * p5-phone 会把 me 的改动自动同步给其他手机。
- * 每次移动只处理“实际进入”的格子：顶墙没动时不触发占地。
+ * 每次移动只处理“实际进入”的格子：顶墙没动时不触发占地/拾取。
  * ============================================================ */
 function moveMe(dx, dy) {
   const nx = constrain(me.x + dx, 0, GRID - 1);
   const ny = constrain(me.y + dy, 0, GRID - 1);
-  if (nx === me.x && ny === me.y) return;   // 没动（顶墙）：不占地、不写状态
+  if (nx === me.x && ny === me.y) return;   // 没动（顶墙）：不占地、不拾取
   me.x = nx;   // 已连接：自动同步；未连接：本地保存，连接时随 hello 补发
   me.y = ny;
-  captureCell(nx, ny);
+  captureCell(nx, ny);   // 空手时占领（携带 Object 时内部跳过）
+  tryPickup(nx, ny);     // 空手进入 Object 格 → 自动尝试拾取
+  tryDeliver(nx, ny);    // 携带回到自己基地 → 自动交付
 }
 
 /* ============================================================
@@ -157,14 +201,13 @@ function moveMe(dx, dy) {
  * 规则：
  *   · 空手玩家进入格子 → 格子归其所有（owner 初始为 null = 无此 key）
  *   · 进入他人格子 → 所有权立即转移（同 key 覆盖，服务器裁决顺序）
- *   · 携带 Object 的玩家不占地（carryingObject 为 Object 系统预留，
- *     当前阶段所有玩家默认为空手 false）
+ *   · 携带 Object 的玩家移动不占领、不抢占任何格子；原有领地保留
  * ============================================================ */
 function captureCell(x, y) {
-  if (me.carryingObject) return;   // 携带 Object 时不能占领（预留）
+  if (me.carryingObject) return;   // 携带 Object 时不能占领
 
   const key  = x + ',' + y;
-  const mine = isShareConfigured() ? String(window.shareClientId || '') : 'local';
+  const mine = myOwnerId();
   if (!mine) return;               // 还没连上服务器：不写本地占地（以服务器地图为准）
 
   const cells = window.shared.cells || (window.shared.cells = {});
@@ -186,7 +229,7 @@ function cellOwner(x, y) {
 
 // HUD 用：自己拥有的格子数量（仅本机显示，无全局排名）
 function myCellCount() {
-  const mine = isShareConfigured() ? String(window.shareClientId || '') : 'local';
+  const mine = myOwnerId();
   if (!mine) return 0;
   const cells = window.shared.cells || {};
   let n = 0;
@@ -195,6 +238,79 @@ function myCellCount() {
     if (c && c.o === mine) n++;
   }
   return n;
+}
+
+/* ============================================================
+ * Object 系统 —— shared.objects[objId] = { state, by }
+ *   state: 'ground'（在地上）| 'carried'（被携带）| 'delivered'（已交付）
+ *   by    : 当前携带者 ID（ground 时无此字段）
+ * ============================================================ */
+
+// 每帧调用：补齐缺失的 Object 条目（老房间/新加入时自愈）
+function healObjects() {
+  if (!window.shared.objects) window.shared.objects = {};
+  for (const o of OBJECTS) {
+    if (!window.shared.objects[o.id]) {
+      window.shared.objects[o.id] = { state: 'ground' };
+    }
+  }
+}
+
+function objectAt(x, y) {
+  for (const o of OBJECTS) {
+    if (o.x === x && o.y === y) return o;
+  }
+  return null;
+}
+
+// 空手玩家进入 Object 所在格时自动尝试拾取
+function tryPickup(x, y) {
+  if (me.carryingObject) return;      // 最多携带一个
+  const obj = objectAt(x, y);
+  if (!obj) return;
+  const st = window.shared.objects && window.shared.objects[obj.id];
+  if (!st || st.state !== 'ground') return;   // 已被人拿走 / 已交付
+  claimObject(obj.id);
+}
+
+/* 拾取宣告（同时是未来双指抢夺的转移入口，本阶段不接线）：
+ * 写入 { carried, by:我的ID }；若同时有人抢同一 Object，
+ * worker 按到达顺序定出唯一 by，输家由 resolveObjectConflicts() 自动放下。 */
+function claimObject(objId) {
+  const mine = myOwnerId();
+  if (!mine) return;
+  if (!window.shared.objects) window.shared.objects = {};
+  window.shared.objects[objId] = { state: 'carried', by: mine };
+  me.carryingObject = objId;   // 记录 Object ID（不是 true/false）
+}
+
+// 携带 Object 回到自己的基地格 → 自动交付
+function tryDeliver(x, y) {
+  if (!me.carryingObject) return;
+  if (me.baseX == null || me.baseY == null) return;
+  if (x !== me.baseX || y !== me.baseY) return;   // 只在自己基地交付
+
+  const objId = me.carryingObject;
+  const st = window.shared.objects && window.shared.objects[objId];
+  if (!st || st.state !== 'carried' || st.by !== myOwnerId()) {
+    // 我其实没抢到（裁决输给了别人）→ 放下即可，不交付
+    me.carryingObject = null;
+    return;
+  }
+  window.shared.objects[objId] = { state: 'delivered', by: myOwnerId() };
+  me.carryingObject = null;                     // 清空 → 恢复占地能力
+  me.delivered = (typeof me.delivered === 'number' ? me.delivered : 0) + 1;
+}
+
+// 每帧调用：裁决回滚 —— 若我携带的 Object 的 by 已不是我（服务器判定别人
+// 拾取/抢夺成功），自动放下，保证所有设备最终一致、只有一个携带者
+function resolveObjectConflicts() {
+  if (!me.carryingObject) return;
+  const st = window.shared.objects && window.shared.objects[me.carryingObject];
+  if (!st) return;
+  if (st.state === 'delivered' || st.state === 'carried' && st.by !== myOwnerId()) {
+    me.carryingObject = null;   // 输了 / 已被交付 → 放下
+  }
 }
 
 /* ============================================================
@@ -231,6 +347,8 @@ function ensureMyColor() {
     const s = SPAWNS[idx % SPAWNS.length];
     me.x = s.x;   // 新玩家放到自己的出生点；重连玩家保留原位置
     me.y = s.y;
+    me.baseX = s.x;   // 基地 = 出生点（随 me 同步给其他玩家）
+    me.baseY = s.y;
     captureCell(s.x, s.y);   // 出生格子自动归自己所有
   }
 }
@@ -422,19 +540,70 @@ function drawBorder() {
   rect(0, 0, WORLD_W, WORLD_H);
 }
 
+/* 地面上的 Object（state = ground 才画）：金色礼物盒 + ID 标签 */
+function drawObjects() {
+  for (const o of OBJECTS) {
+    const st = window.shared.objects && window.shared.objects[o.id];
+    if (!st || st.state !== 'ground') continue;   // 被携带 / 已交付的不画在地上
+
+    const cx = o.x * CELL + CELL / 2;
+    const cy = o.y * CELL + CELL / 2;
+    noStroke();
+    fill(255, 209, 102);
+    rect(cx - CELL * 0.26, cy - CELL * 0.2, CELL * 0.52, CELL * 0.4, 4);
+    fill(230, 170, 60);
+    rect(cx - CELL * 0.04, cy - CELL * 0.3, CELL * 0.08, CELL * 0.6);
+    fill(60, 45, 20);
+    textSize(10);
+    textAlign(CENTER, TOP);
+    text(o.id, cx, cy + CELL * 0.24);
+  }
+}
+
+/* 各玩家基地标记（小旗）：自己 + 其他在线玩家 */
+function drawBaseMarkers() {
+  if (me.baseX != null && me.baseY != null) {
+    drawBaseMarker(me.baseX, me.baseY, colorOf(me.color), true);
+  }
+  const gs = window.guests || [];
+  for (const g of gs) {
+    if (typeof g.color !== 'number' || g.color < 0) continue;
+    if (g.baseX == null || g.baseY == null) continue;
+    drawBaseMarker(g.baseX, g.baseY, colorOf(g.color), false);
+  }
+}
+
+function drawBaseMarker(x, y, col, isSelf) {
+  const cx = x * CELL + CELL / 2;
+  const cy = y * CELL + CELL / 2;
+  noStroke();
+  fill(255, 255, 255, 200);
+  rect(cx + CELL * 0.18, cy - CELL * 0.32, CELL * 0.05, CELL * 0.42);   // 旗杆
+  fill(col);
+  triangle(cx + CELL * 0.2, cy - CELL * 0.3,          // 旗面
+           cx + CELL * 0.42, cy - CELL * 0.22,
+           cx + CELL * 0.2, cy - CELL * 0.14);
+  if (isSelf) {
+    fill(255);
+    textSize(10);
+    textAlign(CENTER, TOP);
+    text('基地', cx + CELL * 0.16, cy - CELL * 0.5);
+  }
+}
+
 function colorOf(i) {
   return PALETTE[typeof i === 'number' && i >= 0 && i < PALETTE.length ? i : 0];
 }
 
 // 渲染自己（me）+ 所有在线玩家（guests，由 p5-phone 自动维护）
 function drawPlayers() {
-  drawOnePlayer({ x: me.x, y: me.y, color: colorOf(me.color) }, true);
+  drawOnePlayer({ x: me.x, y: me.y, color: colorOf(me.color), obj: me.carryingObject || null }, true);
 
   const gs = window.guests || [];
   for (const g of gs) {
     // 新玩家还没完成颜色分配（color 仍为 -1）时不画，避免灰圈闪烁
     if (typeof g.color !== 'number' || g.color < 0) continue;
-    drawOnePlayer({ x: g.x, y: g.y, color: colorOf(g.color) }, false);
+    drawOnePlayer({ x: g.x, y: g.y, color: colorOf(g.color), obj: g.carryingObject || null }, false);
   }
 }
 
@@ -461,15 +630,65 @@ function drawOnePlayer(p, isSelf) {
     textAlign(CENTER, BOTTOM);
     text('你', cx, cy - CELL * 0.5);
   }
+
+  // 携带 Object：头顶金色标记（其他玩家同样可见，因为 obj 来自共享状态）
+  if (p.obj) {
+    const y0 = cy - (isSelf ? CELL * 0.78 : CELL * 0.62);
+    const s = isSelf ? 9 : 7;
+    noStroke();
+    fill(255, 209, 102);
+    quad(cx, y0 - s, cx + s, y0, cx, y0 + s, cx - s, y0);
+    fill(60, 45, 20);
+    textSize(isSelf ? 10 : 9);
+    textAlign(CENTER, CENTER);
+    text(p.obj, cx, y0);
+  }
 }
 
-// HUD：坐标 + 倾斜状态 + 联机状态 + 自己占地数（开发测试用，无全局排名）
+/* 屏幕边缘指向自己基地的箭头（基地在屏幕内时不画；携带 Object 时更醒目） */
+function drawBaseArrow() {
+  const bx = me.baseX, by = me.baseY;
+  if (bx == null || by == null) return;
+
+  // 基地的世界坐标 → 屏幕坐标
+  const sx = bx * CELL + CELL / 2 - gameState.camera.x;
+  const sy = by * CELL + CELL / 2 - gameState.camera.y;
+  const margin = 30;
+  if (sx > margin && sx < width - margin && sy > margin && sy < height - margin) {
+    return;   // 基地在屏幕内：不用箭头
+  }
+
+  const ang = Math.atan2(sy - height / 2, sx - width / 2);
+  const tx = Math.cos(ang), ty = Math.sin(ang);
+  // 从屏幕中心沿方向与边缘矩形（含 margin）求交点
+  const kx = Math.abs(tx) < 1e-6 ? Infinity : ((tx > 0 ? width - margin : margin) - width / 2) / tx;
+  const ky = Math.abs(ty) < 1e-6 ? Infinity : ((ty > 0 ? height - margin : margin) - height / 2) / ty;
+  const k = Math.min(kx, ky);
+  const ax = width / 2 + tx * k;
+  const ay = height / 2 + ty * k;
+
+  const carrying = !!me.carryingObject;
+  const pulse = carrying ? 1 + 0.15 * Math.sin(millis() / 180) : 1;
+  const s = (carrying ? 17 : 12) * pulse;
+
+  push();
+  translate(ax, ay);
+  rotate(ang);
+  noStroke();
+  fill(carrying ? [255, 209, 102] : [255, 255, 255, 140]);
+  triangle(s, 0, -s * 0.6, -s * 0.6, -s * 0.6, s * 0.6);
+  pop();
+}
+
+// HUD：坐标 + 倾斜 + 联机 + 占地/交付（开发测试用，无全局排名）
 function drawHUD() {
+  let line5 = '占地 ' + myCellCount() + ' · 交付 ' + (typeof me.delivered === 'number' ? me.delivered : 0);
+  if (me.carryingObject) line5 += ' · 携带 ' + me.carryingObject;
   const lines = [
     'X ' + me.x + ' · Y ' + me.y,
     sensorStatusText(),
     connectionText(),
-    '占地 ' + myCellCount()
+    line5
   ];
 
   textSize(14);
@@ -641,18 +860,33 @@ function setup() {
       host: SHARE_CONFIG.host,       // URL 参数 ?shareHost= 优先于这里
       room: SHARE_CONFIG.room,
       app: SHARE_CONFIG.app,
-      shared: { cells: {} },        // 占地地图：cells["x,y"] = { o: 玩家ID, c: 颜色下标 }
+      shared: {
+        cells: {},                  // 占地地图：cells["x,y"] = { o: 玩家ID, c: 颜色下标 }
+        objects: {                  // 4 个公共 Object（新房间的初始状态）
+          o1: { state: 'ground' },
+          o2: { state: 'ground' },
+          o3: { state: 'ground' },
+          o4: { state: 'ground' }
+        }
+      },
       me: {
         x: 12, y: 12, color: -1,    // color -1 = 未分配，连接后自动分配
-        carryingObject: false       // 为 Object 系统预留：携带时不能占领
+        carryingObject: null,       // 携带的 Object ID（null = 空手）
+        delivered: 0                // 已交付数量（自己）
       }
     });
     if (typeof showDesktopQr === 'function') showDesktopQr();  // 桌面二维码邀请（手机端自动不显示）
   } else {
     // 单机模式：未配置服务器时仍可本地游玩（me / shared 为普通对象）
-    window.me = { x: 12, y: 12, color: 0, carryingObject: false };
+    window.me = {
+      x: 12, y: 12, color: 0,
+      baseX: 12, baseY: 12,
+      carryingObject: null,
+      delivered: 0
+    };
     window.guests = window.guests || [];
     window.shared.cells = {};
+    window.shared.objects = {};
   }
 
   // 摄像机初始就对正玩家
@@ -667,7 +901,9 @@ function draw() {
   background('#181b26');   // 地图外区域的颜色
 
   updateTilt();
-  ensureMyColor();         // 连接后：分配颜色/出生点、解决颜色冲突
+  healObjects();            // 补齐缺失的 Object 条目
+  ensureMyColor();          // 连接后：分配颜色/出生点/基地、解决颜色冲突
+  resolveObjectConflicts(); // 裁决回滚：抢拾输家自动放下
   updateJoinButton();
   updateCamera();
 
@@ -675,9 +911,12 @@ function draw() {
   translate(-gameState.camera.x, -gameState.camera.y); // 摄像机跟随
   drawTiles();
   drawBorder();
+  drawBaseMarkers();
+  drawObjects();
   drawPlayers();
   pop();
 
+  drawBaseArrow();          // 屏幕边缘指向自己基地的箭头
   drawHUD();
 }
 

@@ -32,8 +32,18 @@ A redesigned multiplayer game based on DECIDER, featuring territory control and 
 - 中立格子 owner 初始为 null；空手玩家进入格子即占领（owner = 玩家 ID，颜色 = 玩家颜色）；进入他人格子立即转移
 - 每次移动只处理实际进入的格子；出生格子自动归自己所有
 - 同步：`shared.cells["x,y"] = { o: 玩家ID, c: 颜色下标 }`，由 p5-phone 按路径补丁同步，所有设备收敛到服务器的同一份值；中途加入的玩家从 welcome 消息获得完整地图
-- `me.carryingObject`（默认 false）为 Object 系统预留：携带 Object 时不占领
+- `me.carryingObject` 携带 Object 时不占领
 - HUD 显示自己拥有的格子数（开发测试用，无全局排名）
+
+### Object（拾取 / 携带 / 交付）
+
+- 地图中央 4 个公共 Object（o1–o4，固定位置）；空手进入 Object 格自动拾取，每人最多携带一个
+- `shared.objects[objId] = { state, by }`（ground / carried / delivered）同步给所有手机；`me.carryingObject` 记录 Object ID
+- 携带者头顶显示金色 Object 标记（所有玩家可见）；携带时移动不占地
+- 基地 = 出生点（`me.baseX/baseY`）；携带回到自己基地自动交付 → Object 标记 delivered（暂不刷新），`me.delivered` +1，恢复占地
+- 屏幕边缘显示指向自己基地的箭头（基地在屏幕内时不显示），携带时更醒目
+- **同时拾取同一 Object**：p5-phone 1.15.0 / 现有 Worker 没有 CAS 或服务端裁决 API；采用「宣告 + 回滚」——worker 按到达顺序定出唯一携带者，输家自动放下（最终一致，有亚秒级双携带过渡窗口，非严格互斥）。详见 `sketch.js` 头部注释
+- `claimObject(objId)` 即预留的双指抢夺转移入口（本阶段未接线）
 
 ### 配置共享服务器（必需，一次性）
 
